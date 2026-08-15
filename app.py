@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
     QLabel, QStackedWidget, QMessageBox, QAbstractItemView, QListWidget,
     QListWidgetItem, QDoubleSpinBox, QSpinBox, QScrollArea, QFrame,
-    QSizePolicy, QButtonGroup, QHeaderView
+    QSizePolicy, QButtonGroup, QHeaderView, QPlainTextEdit
 )
-from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtCore import Qt, QDate, QUrl
 from sqlalchemy import or_
 
@@ -33,6 +33,7 @@ from database import (
     ATTACHMENTS_DIR, REPORTS_DIR, BACKUPS_DIR, DB_PATH,
 )
 from theme import QSS, STATUS_COLORS, status_badge_style, alert_badge_style
+from settings import load_settings, save_settings, save_logo, clear_logo
 import reports as reports_module
 
 APP_TITLE = "FireEngineerAI — نظام إدارة مشاريع الحماية من الحريق"
@@ -44,6 +45,7 @@ NAV_ITEMS = [
     ("equipment", "المعدات والفحص"),
     ("invoices", "الفواتير"),
     ("reports", "التقارير"),
+    ("settings", "الإعدادات"),
 ]
 
 
@@ -168,11 +170,12 @@ class MainWindow(QMainWindow):
         self.page_equipment = self.build_equipment_page()
         self.page_invoices = self.build_invoices_page()
         self.page_reports = self.build_reports_page()
+        self.page_settings = self.build_settings_page()
 
         for p in [
             self.page_dashboard, self.page_projects, self.page_project_form,
             self.page_project_details, self.page_clients, self.page_equipment,
-            self.page_invoices, self.page_reports
+            self.page_invoices, self.page_reports, self.page_settings
         ]:
             self.pages.addWidget(p)
 
@@ -211,6 +214,7 @@ class MainWindow(QMainWindow):
             "equipment": self.show_equipment,
             "invoices": self.show_invoices,
             "reports": self.show_reports,
+            "settings": self.show_settings,
         }
 
         for key, label in NAV_ITEMS:
@@ -1626,6 +1630,224 @@ class MainWindow(QMainWindow):
         self.set_active_nav("reports")
         self.pages.setCurrentWidget(self.page_reports)
         self.statusBar().showMessage("التقارير")
+
+    def show_settings(self):
+        self.set_active_nav("settings")
+        self.load_settings_into_form()
+        self.pages.setCurrentWidget(self.page_settings)
+        self.statusBar().showMessage("إعدادات المنشأة")
+
+    # ------------------------------------------------------------------
+    # Settings (بيانات المنشأة في ترويسة التقارير)
+    # ------------------------------------------------------------------
+    def build_settings_page(self):
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        self.page_header(
+            outer, "إعدادات المنشأة",
+            "هذه البيانات تظهر في ترويسة تقارير الـ PDF"
+        )
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        body = QVBoxLayout(inner)
+        body.setContentsMargins(0, 0, 8, 0)
+
+        row = QHBoxLayout()
+
+        # ---------- بيانات الشركة ----------
+        info_card, info_layout = make_card("بيانات الشركة")
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        self.st_name = QLineEdit()
+        self.st_name.setPlaceholderText("مثال: مؤسسة الشريف لهندسة الحريق")
+        self.st_name_en = QLineEdit()
+        self.st_name_en.setPlaceholderText("Alsharief Fire Engineering Est.")
+        self.st_cr = QLineEdit()
+        self.st_cr.setPlaceholderText("1010xxxxxx")
+        self.st_vat = QLineEdit()
+        self.st_vat.setPlaceholderText("3xxxxxxxxxxxxx3")
+        self.st_phone = QLineEdit()
+        self.st_phone.setPlaceholderText("0501234567")
+        self.st_email = QLineEdit()
+        self.st_email.setPlaceholderText("info@example.com")
+        self.st_website = QLineEdit()
+        self.st_website.setPlaceholderText("www.example.com")
+        self.st_address = QLineEdit()
+        self.st_address.setPlaceholderText("الرياض - حي العليا")
+        self.st_currency = QLineEdit()
+        self.st_currency.setPlaceholderText("ريال")
+
+        form.addRow("اسم الشركة (عربي)", self.st_name)
+        form.addRow("اسم الشركة (إنجليزي)", self.st_name_en)
+        form.addRow("السجل التجاري", self.st_cr)
+        form.addRow("الرقم الضريبي", self.st_vat)
+        form.addRow("الهاتف", self.st_phone)
+        form.addRow("البريد الإلكتروني", self.st_email)
+        form.addRow("الموقع الإلكتروني", self.st_website)
+        form.addRow("العنوان", self.st_address)
+        form.addRow("العملة", self.st_currency)
+        info_layout.addLayout(form)
+        row.addWidget(info_card, 3)
+
+        # ---------- الشعار ----------
+        logo_card, logo_layout = make_card("شعار الشركة")
+        self.st_logo_preview = QLabel("لا يوجد شعار")
+        self.st_logo_preview.setObjectName("PageSubtitle")
+        self.st_logo_preview.setAlignment(Qt.AlignCenter)
+        self.st_logo_preview.setMinimumHeight(150)
+        self.st_logo_preview.setStyleSheet(
+            "border:1px dashed #2a3340; border-radius:8px; padding:8px;"
+        )
+        logo_layout.addWidget(self.st_logo_preview)
+
+        hint = QLabel("PNG أو JPG — يُفضّل خلفية شفافة، ولا يقل العرض عن 300 بكسل")
+        hint.setObjectName("PageSubtitle")
+        hint.setWordWrap(True)
+        logo_layout.addWidget(hint)
+
+        logo_btns = QHBoxLayout()
+        pick_logo = QPushButton("اختيار شعار")
+        pick_logo.clicked.connect(self.pick_company_logo)
+        remove_logo = QPushButton("إزالة")
+        remove_logo.setObjectName("DangerButton")
+        remove_logo.clicked.connect(self.remove_company_logo)
+        logo_btns.addWidget(pick_logo)
+        logo_btns.addWidget(remove_logo)
+        logo_layout.addLayout(logo_btns)
+        logo_layout.addStretch()
+        row.addWidget(logo_card, 2)
+
+        body.addLayout(row)
+
+        # ---------- تذييل التقرير ----------
+        foot_card, foot_layout = make_card("تذييل التقرير")
+        self.st_footer = QPlainTextEdit()
+        self.st_footer.setMaximumHeight(70)
+        self.st_footer.setPlaceholderText(
+            "نص يظهر أسفل كل تقرير — مثال: هذا التقرير معتمد من القسم الفني."
+        )
+        foot_layout.addWidget(self.st_footer)
+        body.addWidget(foot_card)
+
+        # ---------- الأزرار ----------
+        btn_row = QHBoxLayout()
+        preview_btn = QPushButton("معاينة تجريبية للترويسة")
+        preview_btn.clicked.connect(self.preview_letterhead)
+        reset_btn = QPushButton("استرجاع المحفوظ")
+        reset_btn.clicked.connect(self.load_settings_into_form)
+        save_btn = QPushButton("حفظ الإعدادات")
+        save_btn.setObjectName("PrimaryButton")
+        save_btn.clicked.connect(self.save_settings_form)
+        btn_row.addWidget(preview_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(reset_btn)
+        btn_row.addWidget(save_btn)
+        body.addLayout(btn_row)
+        body.addStretch()
+
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+        return w
+
+    def _refresh_logo_preview(self):
+        path = getattr(self, "_pending_logo_path", "") or ""
+        if path and os.path.exists(path):
+            pix = QPixmap(path)
+            if not pix.isNull():
+                self.st_logo_preview.setPixmap(
+                    pix.scaled(240, 140, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+                return
+        self.st_logo_preview.setPixmap(QPixmap())
+        self.st_logo_preview.setText("لا يوجد شعار")
+
+    def load_settings_into_form(self):
+        cfg = load_settings()
+        self.st_name.setText(cfg.get("company_name", ""))
+        self.st_name_en.setText(cfg.get("company_name_en", ""))
+        self.st_cr.setText(cfg.get("cr_number", ""))
+        self.st_vat.setText(cfg.get("vat_number", ""))
+        self.st_phone.setText(cfg.get("phone", ""))
+        self.st_email.setText(cfg.get("email", ""))
+        self.st_website.setText(cfg.get("website", ""))
+        self.st_address.setText(cfg.get("address", ""))
+        self.st_currency.setText(cfg.get("currency", "ريال"))
+        self.st_footer.setPlainText(cfg.get("report_footer", ""))
+        self._pending_logo_path = cfg.get("logo_path", "")
+        self._refresh_logo_preview()
+
+    def pick_company_logo(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "اختر شعار الشركة", "", "Images (*.png *.jpg *.jpeg)"
+        )
+        if not path:
+            return
+        try:
+            # يُنسخ إلى مجلد بيانات البرنامج حتى لا يضيع إن نُقل الأصل
+            self._pending_logo_path = save_logo(path)
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر تحميل الشعار:\n{e}")
+            return
+        self._refresh_logo_preview()
+        self.statusBar().showMessage("تم تحميل الشعار — لا تنسَ الحفظ")
+
+    def remove_company_logo(self):
+        self._pending_logo_path = clear_logo(getattr(self, "_pending_logo_path", ""))
+        self._refresh_logo_preview()
+        self.statusBar().showMessage("تمت إزالة الشعار — لا تنسَ الحفظ")
+
+    def collect_settings_from_form(self):
+        return {
+            "company_name": self.st_name.text().strip(),
+            "company_name_en": self.st_name_en.text().strip(),
+            "cr_number": self.st_cr.text().strip(),
+            "vat_number": self.st_vat.text().strip(),
+            "phone": self.st_phone.text().strip(),
+            "email": self.st_email.text().strip(),
+            "website": self.st_website.text().strip(),
+            "address": self.st_address.text().strip(),
+            "currency": self.st_currency.text().strip() or "ريال",
+            "report_footer": self.st_footer.toPlainText().strip(),
+            "logo_path": getattr(self, "_pending_logo_path", "") or "",
+        }
+
+    def save_settings_form(self):
+        try:
+            save_settings(self.collect_settings_from_form())
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر حفظ الإعدادات:\n{e}")
+            return
+        QMessageBox.information(
+            self, "تم الحفظ",
+            "تم حفظ بيانات المنشأة.\nستظهر في ترويسة كل تقرير PDF جديد."
+        )
+        self.statusBar().showMessage("تم حفظ الإعدادات")
+
+    def preview_letterhead(self):
+        """
+        يولّد تقريرًا تجريبيًا بالإعدادات الحالية (حتى غير المحفوظة) حتى يرى
+        المستخدم شكل الترويسة قبل الاعتماد.
+        """
+        p = self.session.query(Project).order_by(Project.id.desc()).first()
+        if not p:
+            QMessageBox.information(
+                self, "معاينة",
+                "لا توجد مشاريع بعد. أنشئ مشروعًا أولًا لمعاينة شكل التقرير."
+            )
+            return
+        out = os.path.join(REPORTS_DIR, "معاينة_الترويسة.pdf")
+        try:
+            reports_module.generate_project_report_pdf(
+                p, out, settings=self.collect_settings_from_form()
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر إنشاء المعاينة:\n{e}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(out))
 
     def closeEvent(self, event):
         self.session.close()

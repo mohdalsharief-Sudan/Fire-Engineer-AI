@@ -12,8 +12,9 @@ from reportlab.lib.units import mm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, Image
 )
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -136,6 +137,19 @@ def ar(text):
     return str(text)
 
 
+def _load_company_settings():
+    """
+    يقرأ إعدادات المنشأة. الاستيراد داخل الدالة متعمَّد لتفادي دورة استيراد
+    (settings يستورد database، وقد يُستورد reports قبلهما).
+    """
+    try:
+        from settings import load_settings
+        return load_settings()
+    except Exception as e:
+        print("تحذير: تعذر قراءة إعدادات المنشأة:", e)
+        return {}
+
+
 def _styles():
     styles = getSampleStyleSheet()
     for name in ("Normal", "BodyText"):
@@ -156,6 +170,10 @@ def _styles():
     ))
     styles.add(ParagraphStyle(
         name="BodyMuted", fontSize=10, textColor=MUTED,
+        fontName=_ARABIC_FONT_NAME, alignment=TA_RIGHT
+    ))
+    styles.add(ParagraphStyle(
+        name="Letterhead", fontSize=9, leading=13, textColor=DARK,
         fontName=_ARABIC_FONT_NAME, alignment=TA_RIGHT
     ))
     return styles
@@ -190,11 +208,88 @@ def _kv_table(pairs, col_widths=(45 * mm, 120 * mm)):
     return t
 
 
-def generate_project_report_pdf(project, path, company_name="Fire Protection Engineering"):
+def _build_letterhead(cfg, styles):
+    """
+    يبني ترويسة التقرير من إعدادات المنشأة: الشعار على اليسار وبيانات
+    الشركة على اليمين. إن لم يضبط المستخدم أي إعدادات تُعاد ترويسة فارغة
+    ويظل التقرير سليمًا.
+    """
+    flow = []
+
+    name_ar = (cfg.get("company_name") or "").strip()
+    name_en = (cfg.get("company_name_en") or "").strip()
+
+    # سطور التواصل: نعرض الموجود فقط بدل شرطات فارغة
+    contact_bits = []
+    if cfg.get("phone"):
+        contact_bits.append(f"هاتف: {cfg['phone']}")
+    if cfg.get("email"):
+        contact_bits.append(cfg["email"])
+    if cfg.get("website"):
+        contact_bits.append(cfg["website"])
+
+    reg_bits = []
+    if cfg.get("cr_number"):
+        reg_bits.append(f"س.ت: {cfg['cr_number']}")
+    if cfg.get("vat_number"):
+        reg_bits.append(f"الرقم الضريبي: {cfg['vat_number']}")
+
+    info_lines = []
+    if name_ar:
+        info_lines.append(f'<font size="14">{ar(name_ar)}</font>')
+    if name_en:
+        info_lines.append(name_en)
+    if cfg.get("address"):
+        info_lines.append(ar(cfg["address"]))
+    if contact_bits:
+        info_lines.append(ar("  |  ".join(contact_bits)))
+    if reg_bits:
+        info_lines.append(ar("  |  ".join(reg_bits)))
+
+    if not info_lines and not cfg.get("logo_path"):
+        return flow
+
+    info_para = Paragraph("<br/>".join(info_lines), styles["Letterhead"])
+
+    logo_path = cfg.get("logo_path") or ""
+    logo_flowable = ""
+    if logo_path and os.path.exists(logo_path):
+        try:
+            # نحافظ على نسبة أبعاد الصورة داخل صندوق 32×32 مم
+            reader = ImageReader(logo_path)
+            iw, ih = reader.getSize()
+            max_w, max_h = 32 * mm, 32 * mm
+            scale = min(max_w / iw, max_h / ih)
+            logo_flowable = Image(logo_path, width=iw * scale, height=ih * scale)
+        except Exception as e:
+            print("تحذير: تعذر تحميل شعار الشركة:", e)
+            logo_flowable = ""
+
+    # في التخطيط العربي: الشعار يسارًا والنص يمينًا
+    head = Table([[logo_flowable, info_para]], colWidths=[35 * mm, 135 * mm])
+    head.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (0, 0), "LEFT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    flow.append(head)
+    flow.append(Spacer(1, 6))
+    return flow
+
+
+def generate_project_report_pdf(project, path, company_name=None, settings=None):
     """
     project: كائن Project (مع علاقات client / invoices / equipment محمّلة)
     path: مسار ملف الـ PDF الناتج
+    settings: قاموس إعدادات المنشأة. إن لم يُمرَّر تُقرأ من ملف الإعدادات.
+    company_name: للتوافق مع الاستدعاءات القديمة؛ يتجاوز الاسم في الإعدادات.
     """
+    cfg = dict(settings) if settings else _load_company_settings()
+    if company_name:
+        cfg["company_name"] = company_name
+
     styles = _styles()
     doc = SimpleDocTemplate(
         path, pagesize=A4,
@@ -203,7 +298,7 @@ def generate_project_report_pdf(project, path, company_name="Fire Protection Eng
     )
     story = []
 
-    story.append(Paragraph(ar(company_name), styles["ReportSubtitle"]))
+    story.extend(_build_letterhead(cfg, styles))
     # كان اسم المشروع يُطبع بدون ar() فيظهر بحروف مقطّعة إن كان عربيًا
     story.append(Paragraph(ar(f"تقرير مشروع — {project.name}"), styles["ReportTitle"]))
     story.append(HRFlowable(width="100%", thickness=1, color=ACCENT))
@@ -294,13 +389,17 @@ def generate_project_report_pdf(project, path, company_name="Fire Protection Eng
         story.append(Spacer(1, 6))
         total = sum(i.amount or 0 for i in project.invoices)
         unpaid = sum(i.amount or 0 for i in project.invoices if i.status != "Paid")
+        _cur = cfg.get("currency") or ""
         story.append(Paragraph(
-            ar(f"إجمالي الفواتير: {total:,.2f} — غير المسدد: {unpaid:,.2f}"), styles["BodyMuted"]
+            ar(f"إجمالي الفواتير: {total:,.2f} {_cur} — غير المسدد: {unpaid:,.2f} {_cur}"),
+            styles["BodyMuted"]
         ))
 
     story.append(Spacer(1, 20))
     story.append(HRFlowable(width="100%", thickness=0.5, color=MUTED))
-    story.append(Paragraph(ar("تم إنشاء هذا التقرير آليًا بواسطة FireEngineerAI"), styles["BodyMuted"]))
+    _footer = (cfg.get("report_footer") or "").strip() \
+        or "تم إنشاء هذا التقرير آليًا بواسطة FireEngineerAI"
+    story.append(Paragraph(ar(_footer), styles["BodyMuted"]))
 
     doc.build(story)
     return path
