@@ -134,6 +134,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(_app_icon())
         self.setMinimumSize(1360, 860)
         self.setLayoutDirection(Qt.RightToLeft)
 
@@ -1854,9 +1855,32 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _app_icon():
+    """أيقونة البرنامج (تظهر في شريط العنوان وشريط المهام)."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("app_icon.ico", "app_icon.png"):
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            return QIcon(p)
+    return QIcon()
+
+
 def main():
     init_db()
     app = QApplication(sys.argv)
+
+    # على ويندوز: معرّف تطبيق مستقل حتى لا تُجمَّع النافذة تحت أيقونة
+    # بايثون العامة في شريط المهام، بل تظهر بأيقونة البرنامج الخاصة.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "AlSharief.FireEngineerAI.Desktop.1"
+            )
+        except Exception:
+            pass
+
+    app.setWindowIcon(_app_icon())
     app.setStyleSheet(QSS)
     win = MainWindow()
     win.show()
