@@ -34,3 +34,12 @@ desktop.ini
 build/
 dist/
 *.spec
+
+# ÃÏæÇÊ ÊÔÎíÕ ãÄŞÊÉ
+ÊÔÎíÕ.py
+İÍÕ_ÇáãÓÇÑ.py
+
+# ÈŞÇíÇ ÍÒãÉ Google Fonts
+static/
+NotoNaskhArabic-*.ttf
+README.txt
