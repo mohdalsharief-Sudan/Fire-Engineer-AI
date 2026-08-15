@@ -1,0 +1,7 @@
+PySide6>=6.6
+SQLAlchemy>=2.0
+reportlab>=4.0
+
+# اختياري: لتحسين عرض النص العربي داخل تقارير PDF (تشكيل واتجاه صحيح)
+arabic-reshaper>=3.0
+python-bidi>=0.4
