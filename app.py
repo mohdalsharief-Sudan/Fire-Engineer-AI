@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
     QLabel, QStackedWidget, QMessageBox, QAbstractItemView, QListWidget,
     QListWidgetItem, QDoubleSpinBox, QSpinBox, QScrollArea, QFrame,
-    QSizePolicy, QButtonGroup
+    QSizePolicy, QButtonGroup, QHeaderView
 )
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtCore import Qt, QDate, QUrl
@@ -64,6 +64,56 @@ def make_card(title=None):
         lbl.setObjectName("PageSubtitle")
         layout.addWidget(lbl)
     return card, layout
+
+
+def set_badge_cell(table, row, col, text, style):
+    """
+    يضع شارة ملوّنة داخل خلية جدول بعرض كافٍ.
+
+    المشكلة التي تعالجها: setCellWidget() وحده لا يُحسب ضمن عرض العمود عند
+    ResizeToContents (لأن الحساب يعتمد على عناصر QTableWidgetItem لا الودجات)،
+    فكانت الشارات تظهر مقصوصة مثل "غير مة" بدل "غير مسددة".
+    الحل: نضع عنصرًا نصيًا مخفيًا خلف الشارة ليأخذ العمود عرضه الصحيح.
+    """
+    label = QLabel(text)
+    label.setStyleSheet(style)
+    label.setAlignment(Qt.AlignCenter)
+    fm = label.fontMetrics()
+    # عرض النص + مساحة الحشو (padding 10px من الجانبين) + الإطار + هامش أمان
+    badge_w = fm.horizontalAdvance(text) + 44
+    label.setMinimumWidth(badge_w)
+    label.setMinimumHeight(fm.height() + 6)
+
+    # عنصر مخفي يمنح العمود عرضًا كافيًا عند ResizeToContents
+    sizing_item = QTableWidgetItem(text + "      ")
+    sizing_item.setForeground(Qt.transparent)
+    table.setItem(row, col, sizing_item)
+
+    holder = QWidget()
+    lay = QHBoxLayout(holder)
+    lay.setContentsMargins(6, 3, 6, 3)
+    lay.addWidget(label)
+    table.setCellWidget(row, col, holder)
+
+
+def tune_table(table, stretch_col=None):
+    """
+    إعدادات موحّدة لجداول البرنامج: عرض أعمدة مناسب، إخفاء عمود الترقيم
+    الرأسي الفارغ، وارتفاع صفوف مريح.
+    بدونها كانت الأعمدة ضيقة والنصوص العربية مقصوصة بنقاط (...).
+    """
+    table.verticalHeader().setVisible(False)
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeToContents)
+    if stretch_col is not None:
+        header.setSectionResizeMode(stretch_col, QHeaderView.Stretch)
+    else:
+        header.setStretchLastSection(True)
+    table.setAlternatingRowColors(True)
+    table.setWordWrap(False)
+    # ارتفاع صف كافٍ لاحتواء الشارات الملوّنة دون قصّها عموديًا
+    table.verticalHeader().setDefaultSectionSize(38)
+    return table
 
 
 def make_stat_card(value_text, label_text):
@@ -236,6 +286,7 @@ class MainWindow(QMainWindow):
         self.dashboard_alerts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.dashboard_alerts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.dashboard_alerts_table.setMaximumHeight(220)
+        tune_table(self.dashboard_alerts_table, stretch_col=1)
         alerts_layout.addWidget(self.dashboard_alerts_table)
         mid_row.addWidget(alerts_card, 2)
 
@@ -249,6 +300,7 @@ class MainWindow(QMainWindow):
         )
         self.dashboard_invoices_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.dashboard_invoices_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tune_table(self.dashboard_invoices_table, stretch_col=1)
         inv_layout.addWidget(self.dashboard_invoices_table)
         layout.addWidget(inv_card)
 
@@ -293,9 +345,10 @@ class MainWindow(QMainWindow):
             self.dashboard_alerts_table.setItem(row, 1, QTableWidgetItem(e.project.name if e.project else ""))
             nxt = e.next_inspection_date
             self.dashboard_alerts_table.setItem(row, 2, QTableWidgetItem(str(nxt) if nxt else "-"))
-            badge = QLabel("متأخر" if e.alert_level == "overdue" else "قريب")
-            badge.setStyleSheet(alert_badge_style(e.alert_level))
-            self.dashboard_alerts_table.setCellWidget(row, 3, badge)
+            _txt = {"overdue": "متأخر", "soon": "قريب",
+                    "unknown": "لم يُفحص"}.get(e.alert_level, "قريب")
+            set_badge_cell(self.dashboard_alerts_table, row, 3, _txt,
+                           alert_badge_style(e.alert_level))
 
         # فواتير غير مسددة
         invs = unpaid_invoices(self.session)
@@ -307,10 +360,16 @@ class MainWindow(QMainWindow):
             self.dashboard_invoices_table.setItem(row, 1, QTableWidgetItem(i.project.name if i.project else ""))
             self.dashboard_invoices_table.setItem(row, 2, QTableWidgetItem(f"{i.amount:,.2f}" if i.amount else "0.00"))
             self.dashboard_invoices_table.setItem(row, 3, QTableWidgetItem(str(i.due_date) if i.due_date else "-"))
-            level = "overdue" if i.is_overdue else "soon"
-            badge = QLabel("متأخرة" if i.is_overdue else i.status)
-            badge.setStyleSheet(alert_badge_style(level if i.is_overdue else "none"))
-            self.dashboard_invoices_table.setCellWidget(row, 4, badge)
+            # كان يعرض حالة إنجليزية خام ("Unpaid") وسط واجهة عربية،
+            # وبلون أخضر يوحي بأنها مسددة.
+            if i.is_overdue:
+                set_badge_cell(self.dashboard_invoices_table, row, 4,
+                               "متأخرة", alert_badge_style("overdue"))
+            else:
+                _txt = "مسددة" if i.status == "Paid" else "غير مسددة"
+                _lvl = "none" if i.status == "Paid" else "soon"
+                set_badge_cell(self.dashboard_invoices_table, row, 4, _txt,
+                               alert_badge_style(_lvl))
 
     # ------------------------------------------------------------------
     # Navigation show_* helpers (نتابع في الأجزاء التالية)
@@ -339,6 +398,29 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "خطأ", f"تعذر إنشاء نسخة احتياطية:\n{e}")
 
+    def safe_commit(self, action="الحفظ"):
+        """
+        يحفظ التغييرات ويتعامل مع الأخطاء بأمان.
+
+        سبب وجودها: في SQLAlchemy إذا فشل commit (مثلًا قيمة مطلوبة ناقصة)
+        تبقى الجلسة في حالة معطوبة، وكل عملية حفظ لاحقة تفشل بـ
+        PendingRollbackError حتى لو كانت سليمة تمامًا — أي أن البرنامج
+        يتوقف عن الحفظ نهائيًا حتى يُعاد تشغيله. rollback() يعيد الجلسة
+        لحالة صالحة.
+
+        ترجع True عند النجاح و False عند الفشل.
+        """
+        try:
+            self.session.commit()
+            return True
+        except Exception as e:
+            self.session.rollback()
+            QMessageBox.critical(
+                self, "خطأ في قاعدة البيانات",
+                f"تعذر {action}. لم يتم حفظ أي تغيير.\n\nالتفاصيل:\n{e}"
+            )
+            return False
+
     # ------------------------------------------------------------------
     # Projects: قائمة + بحث
     # ------------------------------------------------------------------
@@ -361,8 +443,12 @@ class MainWindow(QMainWindow):
         self.project_search.textChanged.connect(self.refresh_projects_table)
 
         self.project_status_filter = QComboBox()
-        self.project_status_filter.addItems(["", "Design", "Supply", "Install", "Testing", "Handover"])
-        self.project_status_filter.currentTextChanged.connect(self.refresh_projects_table)
+        # كان أول عنصر فارغًا تمامًا فيبدو كعطل. الآن له تسمية واضحة
+        # مع الاحتفاظ بالقيمة الفارغة في الخلفية (userData) للفلترة.
+        self.project_status_filter.addItem("كل الحالات", "")
+        for _st in ["Design", "Supply", "Install", "Testing", "Handover"]:
+            self.project_status_filter.addItem(_st, _st)
+        self.project_status_filter.currentIndexChanged.connect(self.refresh_projects_table)
 
         self.project_client_filter = QComboBox()
         self.project_client_filter.addItem("كل العملاء", None)
@@ -380,6 +466,7 @@ class MainWindow(QMainWindow):
         self.projects_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.projects_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.projects_table.itemDoubleClicked.connect(self.open_project_details_from_table)
+        tune_table(self.projects_table, stretch_col=1)  # عمود الاسم يتمدد
         layout.addWidget(self.projects_table)
 
         return w
@@ -412,7 +499,7 @@ class MainWindow(QMainWindow):
 
     def refresh_projects_table(self):
         text = self.project_search.text().strip()
-        status = self.project_status_filter.currentText()
+        status = self.project_status_filter.currentData() or ""
         client_id = self.project_client_filter.currentData()
         rows = search_projects(self.session, text=text, status=status, client_id=client_id)
         self.fill_projects_table(self.projects_table, rows)
@@ -427,9 +514,8 @@ class MainWindow(QMainWindow):
             table.setItem(row, 2, QTableWidgetItem(r.client_name))
             table.setItem(row, 3, QTableWidgetItem(r.site or ""))
             table.setItem(row, 4, QTableWidgetItem(r.scope or ""))
-            status_badge = QLabel(r.status or "")
-            status_badge.setStyleSheet(status_badge_style(r.status or ""))
-            table.setCellWidget(row, 5, status_badge)
+            set_badge_cell(table, row, 5, r.status or "-",
+                           status_badge_style(r.status or ""))
             days = ""
             if r.start_date and r.end_date:
                 days = str((r.end_date - r.start_date).days)
@@ -608,7 +694,8 @@ class MainWindow(QMainWindow):
         p.end_date = self.pf_end.date().toPython()
         p.notes = self.pf_notes.toPlainText().strip()
 
-        self.session.commit()
+        if not self.safe_commit("حفظ المشروع"):
+            return
 
         if self.pf_pending_attachments:
             proj_dir = os.path.join(ATTACHMENTS_DIR, str(p.id))
@@ -660,6 +747,7 @@ class MainWindow(QMainWindow):
         self.pd_equipment_table.setHorizontalHeaderLabels(["المعدة", "النوع", "الفحص القادم", "الحالة"])
         self.pd_equipment_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.pd_equipment_table.setMaximumHeight(160)
+        tune_table(self.pd_equipment_table, stretch_col=0)
         eq_layout.addWidget(self.pd_equipment_table)
         layout.addWidget(eq_card)
 
@@ -722,9 +810,11 @@ class MainWindow(QMainWindow):
             self.pd_equipment_table.setItem(row, 1, QTableWidgetItem(e.equipment_type or ""))
             nxt = e.next_inspection_date
             self.pd_equipment_table.setItem(row, 2, QTableWidgetItem(str(nxt) if nxt else "-"))
-            badge = QLabel("متأخر" if e.alert_level == "overdue" else ("قريب" if e.alert_level == "soon" else "سليم"))
-            badge.setStyleSheet(alert_badge_style(e.alert_level))
-            self.pd_equipment_table.setCellWidget(row, 3, badge)
+            _lvl = e.alert_level
+            _txt = {"overdue": "متأخر", "soon": "قريب",
+                    "none": "سليم", "unknown": "لم يُفحص"}.get(_lvl, "—")
+            set_badge_cell(self.pd_equipment_table, row, 3, _txt,
+                           alert_badge_style(_lvl))
 
         self.set_active_nav("projects")
         self.pages.setCurrentWidget(self.page_project_details)
@@ -787,7 +877,8 @@ class MainWindow(QMainWindow):
         if not p:
             return
         self.session.delete(p)
-        self.session.commit()
+        if not self.safe_commit("حذف المشروع"):
+            return
         folder = os.path.join(ATTACHMENTS_DIR, str(pid))
         if os.path.exists(folder):
             shutil.rmtree(folder, ignore_errors=True)
@@ -823,6 +914,7 @@ class MainWindow(QMainWindow):
         self.clients_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.clients_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.clients_table.itemClicked.connect(self.load_client_for_edit_from_table)
+        tune_table(self.clients_table, stretch_col=0)
         list_layout.addWidget(self.clients_table)
         body.addWidget(list_card, 3)
 
@@ -917,7 +1009,8 @@ class MainWindow(QMainWindow):
         c.email = self.cf_email.text().strip()
         c.address = self.cf_address.text().strip()
         c.notes = self.cf_notes.toPlainText().strip()
-        self.session.commit()
+        if not self.safe_commit("حفظ العميل"):
+            return
         QMessageBox.information(self, "تم الحفظ", f"تم حفظ العميل #{c.id} بنجاح.")
         self.refresh_all()
         self.new_client_form()
@@ -940,7 +1033,8 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self.session.delete(c)
-        self.session.commit()
+        if not self.safe_commit("حذف العميل"):
+            return
         QMessageBox.information(self, "تم الحذف", "تم حذف العميل.")
         self.refresh_all()
         self.new_client_form()
@@ -992,6 +1086,7 @@ class MainWindow(QMainWindow):
         self.equipment_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.equipment_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.equipment_table.itemClicked.connect(self.load_equipment_for_edit_from_table)
+        tune_table(self.equipment_table, stretch_col=0)
         list_layout.addWidget(self.equipment_table)
         body.addWidget(list_card, 3)
 
@@ -1094,7 +1189,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "تنبيه", "الرجاء إدخال اسم المعدة.")
             return
         if not project_id:
-            QMessageBox.warning(self, "تنبيه", "الرجاء اختيار المشروع المرتبط بالمعدة.")
+            if self.ef_project_combo.count() == 0:
+                QMessageBox.warning(
+                    self, "لا توجد مشاريع",
+                    "لا يمكن إضافة معدة قبل إنشاء مشروع.\n"
+                    "أنشئ مشروعًا أولًا من صفحة المشاريع ثم عد إلى هنا."
+                )
+            else:
+                QMessageBox.warning(self, "تنبيه", "الرجاء اختيار المشروع المرتبط بالمعدة.")
             return
 
         if self.current_edit_equipment_id is None:
@@ -1114,7 +1216,8 @@ class MainWindow(QMainWindow):
         e.interval_days = self.ef_interval.value()
         e.status = self.ef_status.currentText()
         e.notes = self.ef_notes.toPlainText().strip()
-        self.session.commit()
+        if not self.safe_commit("حفظ المعدة"):
+            return
         QMessageBox.information(self, "تم الحفظ", f"تم حفظ المعدة #{e.id} بنجاح.")
         self.refresh_all()
         self.new_equipment_form()
@@ -1130,7 +1233,8 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self.session.delete(e)
-        self.session.commit()
+        if not self.safe_commit("حذف المعدة"):
+            return
         QMessageBox.information(self, "تم الحذف", "تم حذف المعدة.")
         self.refresh_all()
         self.new_equipment_form()
@@ -1159,10 +1263,12 @@ class MainWindow(QMainWindow):
             self.equipment_table.setItem(row, 3, QTableWidgetItem(str(nxt) if nxt else "-"))
             self.equipment_table.setItem(row, 4, QTableWidgetItem(e.status or ""))
             level = e.alert_level
-            badge_text = {"overdue": "متأخر", "soon": "قريب", "none": "سليم"}[level]
-            badge = QLabel(badge_text)
-            badge.setStyleSheet(alert_badge_style(level))
-            self.equipment_table.setCellWidget(row, 5, badge)
+            # "unknown" = لم يُسجَّل تاريخ فحص. بدون .get() كان البرنامج
+            # ينهار بـ KeyError على أي معدة بلا تاريخ فحص.
+            badge_text = {"overdue": "متأخر", "soon": "قريب",
+                          "none": "سليم", "unknown": "لم يُفحص"}.get(level, "—")
+            set_badge_cell(self.equipment_table, row, 5, badge_text,
+                           alert_badge_style(level))
 
     # ------------------------------------------------------------------
     # Invoices
@@ -1180,8 +1286,11 @@ class MainWindow(QMainWindow):
         self.invoice_search.setPlaceholderText("ابحث برقم الفاتورة أو المشروع...")
         self.invoice_search.textChanged.connect(self.refresh_invoices_table)
         self.invoice_status_filter = QComboBox()
-        self.invoice_status_filter.addItems(["", "Unpaid", "Paid", "Overdue"])
-        self.invoice_status_filter.currentTextChanged.connect(self.refresh_invoices_table)
+        self.invoice_status_filter.addItem("كل الفواتير", "")
+        self.invoice_status_filter.addItem("غير مسددة", "Unpaid")
+        self.invoice_status_filter.addItem("مسددة", "Paid")
+        self.invoice_status_filter.addItem("متأخرة", "Overdue")
+        self.invoice_status_filter.currentIndexChanged.connect(self.refresh_invoices_table)
         new_inv_btn = QPushButton("+ فاتورة جديدة")
         new_inv_btn.setObjectName("PrimaryButton")
         new_inv_btn.clicked.connect(self.new_invoice_form)
@@ -1195,6 +1304,7 @@ class MainWindow(QMainWindow):
         self.invoices_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.invoices_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.invoices_table.itemClicked.connect(self.load_invoice_for_edit_from_table)
+        tune_table(self.invoices_table, stretch_col=1)
         list_layout.addWidget(self.invoices_table)
         body.addWidget(list_card, 3)
 
@@ -1287,7 +1397,14 @@ class MainWindow(QMainWindow):
     def save_invoice_form(self):
         project_id = self.if_project_combo.currentData()
         if not project_id:
-            QMessageBox.warning(self, "تنبيه", "الرجاء اختيار المشروع.")
+            if self.if_project_combo.count() == 0:
+                QMessageBox.warning(
+                    self, "لا توجد مشاريع",
+                    "لا يمكن إصدار فاتورة قبل إنشاء مشروع.\n"
+                    "أنشئ مشروعًا أولًا من صفحة المشاريع ثم عد إلى هنا."
+                )
+            else:
+                QMessageBox.warning(self, "تنبيه", "الرجاء اختيار المشروع.")
             return
 
         if self.current_edit_invoice_id is None:
@@ -1306,7 +1423,8 @@ class MainWindow(QMainWindow):
         i.due_date = self.if_due_date.date().toPython()
         i.status = self.if_status.currentText()
         i.notes = self.if_notes.toPlainText().strip()
-        self.session.commit()
+        if not self.safe_commit("حفظ الفاتورة"):
+            return
         QMessageBox.information(self, "تم الحفظ", f"تم حفظ الفاتورة #{i.id} بنجاح.")
         self.refresh_all()
         self.new_invoice_form()
@@ -1322,14 +1440,15 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self.session.delete(i)
-        self.session.commit()
+        if not self.safe_commit("حذف الفاتورة"):
+            return
         QMessageBox.information(self, "تم الحذف", "تم حذف الفاتورة.")
         self.refresh_all()
         self.new_invoice_form()
 
     def refresh_invoices_table(self):
         text = self.invoice_search.text().strip()
-        status = self.invoice_status_filter.currentText()
+        status = self.invoice_status_filter.currentData() or ""
         q = self.session.query(Invoice)
         if text:
             like = f"%{text}%"
@@ -1355,12 +1474,13 @@ class MainWindow(QMainWindow):
             self.invoices_table.setItem(row, 2, QTableWidgetItem(f"{i.amount:,.2f}" if i.amount else "0.00"))
             self.invoices_table.setItem(row, 3, QTableWidgetItem(str(i.due_date) if i.due_date else "-"))
             if i.is_overdue:
-                badge = QLabel("متأخرة")
-                badge.setStyleSheet(alert_badge_style("overdue"))
+                set_badge_cell(self.invoices_table, row, 4, "متأخرة",
+                               alert_badge_style("overdue"))
             else:
-                badge = QLabel("مسددة" if i.status == "Paid" else "غير مسددة")
-                badge.setStyleSheet(alert_badge_style("none" if i.status == "Paid" else "soon"))
-            self.invoices_table.setCellWidget(row, 4, badge)
+                _txt = "مسددة" if i.status == "Paid" else "غير مسددة"
+                _lvl = "none" if i.status == "Paid" else "soon"
+                set_badge_cell(self.invoices_table, row, 4, _txt,
+                               alert_badge_style(_lvl))
 
     # ------------------------------------------------------------------
     # Reports (PDF + CSV exports)
@@ -1448,7 +1568,11 @@ class MainWindow(QMainWindow):
                 elif kind == "invoices":
                     writer.writerow(["ID", "Project", "InvoiceNumber", "Amount", "IssueDate", "DueDate", "Status"])
                     for i in self.session.query(Invoice).order_by(Invoice.id.asc()).all():
-                        writer.writerow([i.id, i.project.name if i.project else "", i.invoice_number, i.amount, i.issue_date, i.due_date, i.status])
+                        # الحالة الفعلية: الفاتورة المتأخرة كانت تُصدَّر كـ "Unpaid"
+                        # فلا يمكن تمييز المتأخر في Excel
+                        eff_status = "Overdue" if i.is_overdue else i.status
+                        writer.writerow([i.id, i.project.name if i.project else "", i.invoice_number,
+                                         i.amount, i.issue_date, i.due_date, eff_status])
                 elif kind == "equipment":
                     writer.writerow(["ID", "Project", "Name", "Type", "Location", "LastInspection", "IntervalDays", "NextInspection", "Status"])
                     for e in self.session.query(Equipment).order_by(Equipment.id.asc()).all():

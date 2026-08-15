@@ -30,6 +30,7 @@ ALERT_COLORS = {
     "overdue": DANGER,
     "soon": WARNING,
     "none": SUCCESS,
+    "unknown": "#7a8699",   # معدة لم يُسجَّل لها تاريخ فحص إطلاقًا
 }
 
 QSS = f"""

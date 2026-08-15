@@ -8,7 +8,7 @@ import os
 from datetime import date, timedelta
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Date, Text, Float,
+    create_engine, Column, Integer, String, Date, Text, Float, event,
     ForeignKey, or_
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
@@ -29,6 +29,15 @@ engine = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine)
 
 
+# SQLite يتجاهل قيود المفاتيح الأجنبية (ومنها ON DELETE SET NULL) ما لم تُفعَّل
+# صراحةً لكل اتصال. بدون هذا السطر يبقى client_id مشيرًا لعميل محذوف.
+@event.listens_for(engine, "connect")
+def _enable_sqlite_fk(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -44,7 +53,10 @@ class Client(Base):
     address = Column(String)
     notes = Column(Text)
 
-    projects = relationship("Project", back_populates="client", cascade="all, delete-orphan")
+    # ملاحظة مهمة: كانت هنا cascade="all, delete-orphan" وهذا يعني أن حذف عميل
+    # يحذف كل مشاريعه (وبالتالي فواتيرها ومعداتها) بصمت — خطر فقدان بيانات.
+    # الآن: عند حذف العميل تبقى المشاريع ويصبح client_id = NULL.
+    projects = relationship("Project", back_populates="client", passive_deletes=True)
 
     @property
     def open_projects_count(self):
@@ -56,7 +68,7 @@ class Project(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    client_id = Column(Integer, ForeignKey("clients.id"))
+    client_id = Column(Integer, ForeignKey("clients.id", ondelete="SET NULL"))
     site = Column(String)
     building = Column(String)
     scope = Column(String)
@@ -132,10 +144,17 @@ class Equipment(Base):
 
     @property
     def alert_level(self):
-        """none | soon | overdue"""
+        """none | soon | overdue | unknown
+
+        "unknown" = معدة لم يُسجَّل لها تاريخ فحص إطلاقًا.
+        سابقًا كانت تُعامل كـ "سليم" فتختفي من التنبيهات تمامًا رغم أنها
+        في الواقع لم تُفحص أبدًا — وهذا أخطر من التأخر في الفحص.
+        """
+        if not self.last_inspection_date:
+            return "unknown"
         d = self.days_until_due
         if d is None:
-            return "none"
+            return "unknown"
         if d < 0:
             return "overdue"
         if d <= 30:
@@ -200,18 +219,28 @@ def get_session():
 # Shared query helpers
 # ---------------------------------------------------------------------------
 
+def _escape_like(text):
+    """
+    يهرّب محارف LIKE الخاصة (% و _) حتى لا يتحول بحث المستخدم عن "%" أو "_"
+    إلى بحث شامل يعيد كل السجلات.
+    """
+    return (text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_"))
+
+
 def search_projects(session, text="", status="", client_id=None):
     q = session.query(Project)
     if text:
-        like = f"%{text}%"
+        like = f"%{_escape_like(text)}%"
         q = q.filter(or_(
-            Project.name.ilike(like),
-            Project.site.ilike(like),
-            Project.building.ilike(like),
-            Project.scope.ilike(like),
-            Project.standard.ilike(like),
-            Project.status.ilike(like),
-            Project.notes.ilike(like),
+            Project.name.ilike(like, escape="\\"),
+            Project.site.ilike(like, escape="\\"),
+            Project.building.ilike(like, escape="\\"),
+            Project.scope.ilike(like, escape="\\"),
+            Project.standard.ilike(like, escape="\\"),
+            Project.status.ilike(like, escape="\\"),
+            Project.notes.ilike(like, escape="\\"),
         ))
     if status:
         q = q.filter(Project.status == status)
@@ -221,13 +250,23 @@ def search_projects(session, text="", status="", client_id=None):
 
 
 def upcoming_inspections(session, within_days=30):
-    """Equipment whose next inspection is overdue or due within `within_days`."""
+    """
+    المعدات التي يلزم الانتباه لها: متأخرة، أو قريبة الاستحقاق،
+    أو لم يُسجَّل لها تاريخ فحص إطلاقًا ("unknown").
+
+    سابقًا كانت المعدات بلا تاريخ فحص تُستثنى من هذه القائمة رغم أنها
+    الأولى بالمتابعة.
+    """
     items = session.query(Equipment).all()
-    out = []
-    for e in items:
-        if e.alert_level in ("soon", "overdue"):
-            out.append(e)
-    out.sort(key=lambda e: (e.days_until_due is None, e.days_until_due))
+    out = [e for e in items if e.alert_level in ("soon", "overdue", "unknown")]
+
+    def sort_key(e):
+        # المتأخر أولًا، ثم غير المفحوص، ثم الأقرب موعدًا
+        rank = {"overdue": 0, "unknown": 1, "soon": 2}.get(e.alert_level, 3)
+        d = e.days_until_due
+        return (rank, d if d is not None else 10**6)
+
+    out.sort(key=sort_key)
     return out
 
 

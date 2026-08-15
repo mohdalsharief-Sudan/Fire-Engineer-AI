@@ -1,0 +1,36 @@
+# ملفات بايثون المؤقتة (كانت مرفوعة على GitHub بالخطأ)
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# البيئات الافتراضية
+.venv/
+venv/
+env/
+
+# قواعد البيانات والنسخ الاحتياطية المحلية
+*.sqlite3
+*.db
+db_legacy_backup_*.sqlite3
+
+# مخرجات البرنامج
+reports/
+backups/
+storage/
+*_export.csv
+
+# ملفات النظام
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# إعدادات المحررات
+.vscode/
+.idea/
+*.swp
+
+# ملفات البناء
+build/
+dist/
+*.spec
