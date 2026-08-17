@@ -5,12 +5,13 @@ reports.py
 """
 
 import os
+from datetime import date
 
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import mm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_RIGHT
+from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, Image
 )
@@ -277,6 +278,265 @@ def _build_letterhead(cfg, styles):
     flow.append(head)
     flow.append(Spacer(1, 6))
     return flow
+
+
+# ---------------------------------------------------------------------------
+# أدوات مشتركة للتقارير المجمّعة
+# ---------------------------------------------------------------------------
+
+def _doc(path, landscape_mode=False):
+    """مستند A4 بهوامش موحّدة. landscape للجداول العريضة."""
+    size = landscape(A4) if landscape_mode else A4
+    return SimpleDocTemplate(
+        path, pagesize=size,
+        leftMargin=15 * mm, rightMargin=15 * mm,
+        topMargin=15 * mm, bottomMargin=15 * mm
+    )
+
+
+def _cell(text, bold=False, align=TA_CENTER, color=None):
+    """
+    خلية جدول كـ Paragraph حتى يلتفّ النص الطويل داخل العمود.
+    النص الخام في Table لا يلتفّ، فكان يتجاوز حدود الخلية ويتداخل
+    مع العمود المجاور (مثل "Combined (Alarm + Sprinklers)").
+    """
+    st = ParagraphStyle(
+        name="cell_b" if bold else "cell",
+        fontName=_ARABIC_BOLD_NAME if bold else _ARABIC_FONT_NAME,
+        fontSize=8.5, leading=11, alignment=align,
+        textColor=color if color is not None else DARK,
+    )
+    return Paragraph(str(text), st)
+
+
+def _data_table(header, rows, col_widths, align_right_cols=()):
+    """
+    جدول بيانات بنمط موحّد (رأس داكن، صفوف متناوبة).
+    header/rows: نصوص جاهزة (مرّرها عبر ar() قبل الاستدعاء عند الحاجة).
+    """
+    hdr = [_cell(h, bold=True, color=colors.white) for h in header]
+    body = []
+    for r in rows:
+        body.append([
+            # الخلايا المبنية مسبقًا (مثل صف الإجمالي العريض) تُمرَّر كما هي
+            v if isinstance(v, Paragraph)
+            else _cell(v, align=TA_RIGHT if i in align_right_cols else TA_CENTER)
+            for i, v in enumerate(r)
+        ])
+    data = [hdr] + body
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    style = [
+        ("FONTNAME", (0, 0), (-1, -1), _ARABIC_FONT_NAME),
+        ("FONTNAME", (0, 0), (-1, 0), _ARABIC_BOLD_NAME),
+        ("BACKGROUND", (0, 0), (-1, 0), DARK),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dddddd")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f7f7")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+    ]
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _report_head(story, styles, cfg, title, subtitle=""):
+    """ترويسة المنشأة + عنوان التقرير + تاريخ الإصدار."""
+    story.extend(_build_letterhead(cfg, styles))
+    story.append(Paragraph(ar(title), styles["ReportTitle"]))
+    if subtitle:
+        story.append(Paragraph(ar(subtitle), styles["ReportSubtitle"]))
+    story.append(Paragraph(
+        ar(f"تاريخ إصدار التقرير: {date.today().isoformat()}"), styles["BodyMuted"]
+    ))
+    story.append(HRFlowable(width="100%", thickness=1, color=ACCENT))
+    story.append(Spacer(1, 10))
+
+
+def _report_foot(story, styles, cfg):
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=MUTED))
+    footer = (cfg.get("report_footer") or "").strip() \
+        or "تم إنشاء هذا التقرير آليًا بواسطة FireEngineerAI"
+    story.append(Paragraph(ar(footer), styles["BodyMuted"]))
+
+
+# ---------------------------------------------------------------------------
+# تقرير الفحوصات الدورية (للدفاع المدني / متابعة الصيانة)
+# ---------------------------------------------------------------------------
+
+def generate_inspections_report_pdf(equipment_list, path, settings=None,
+                                    title="تقرير الفحوصات الدورية للمعدات"):
+    """
+    equipment_list: قائمة كائنات Equipment (مرتّبة كما نريد عرضها).
+    يعرض حالة كل معدة وموعد فحصها القادم مع تلوين الصفوف المتأخرة.
+    """
+    cfg = dict(settings) if settings else _load_company_settings()
+    styles = _styles()
+    doc = _doc(path, landscape_mode=True)
+    story = []
+
+    # إحصاء سريع حسب الحالة
+    counts = {"overdue": 0, "unknown": 0, "soon": 0, "none": 0}
+    for e in equipment_list:
+        counts[e.alert_level] = counts.get(e.alert_level, 0) + 1
+
+    _report_head(
+        story, styles, cfg, title,
+        f"إجمالي المعدات: {len(equipment_list)}  |  "
+        f"متأخرة: {counts['overdue']}  |  "
+        f"لم تُفحص: {counts['unknown']}  |  "
+        f"قريبة: {counts['soon']}  |  "
+        f"سليمة: {counts['none']}"
+    )
+
+    if not equipment_list:
+        story.append(Paragraph(ar("لا توجد معدات مسجّلة."), styles["Normal"]))
+        _report_foot(story, styles, cfg)
+        doc.build(story)
+        return path
+
+    label = {"overdue": "متأخر", "soon": "قريب", "none": "سليم", "unknown": "لم يُفحص"}
+    header = [ar(h) for h in [
+        "م", "المعدة", "النوع", "المشروع", "الموقع",
+        "آخر فحص", "الدورة (يوم)", "الفحص القادم", "المتبقي", "التنبيه"
+    ]]
+
+    rows = []
+    row_colors = []
+    for idx, e in enumerate(equipment_list, start=1):
+        d = e.days_until_due
+        if d is None:
+            remaining = "—"
+        elif d < 0:
+            remaining = f"متأخر ({abs(d)} يوم)"
+        else:
+            remaining = f"باقٍ ({d} يوم)"
+        nxt = e.next_inspection_date
+        rows.append([
+            str(idx),
+            ar(e.name or "-"),
+            ar(e.equipment_type or "-"),
+            ar(e.project.name if e.project else "-"),
+            ar(e.location or "-"),
+            str(e.last_inspection_date) if e.last_inspection_date else "—",
+            str(e.interval_days or "-"),
+            str(nxt) if nxt else "—",
+            ar(remaining),
+            ar(label.get(e.alert_level, "-")),
+        ])
+        row_colors.append(e.alert_level)
+
+    widths = [10 * mm, 45 * mm, 30 * mm, 50 * mm, 32 * mm,
+              23 * mm, 18 * mm, 23 * mm, 24 * mm, 20 * mm]
+    t = _data_table(header, rows, widths)
+
+    # تلوين خانة التنبيه حسب الخطورة — يسهّل القراءة السريعة
+    tint = {
+        "overdue": colors.HexColor("#f8d7da"),
+        "unknown": colors.HexColor("#e2e3e5"),
+        "soon": colors.HexColor("#fff3cd"),
+        "none": colors.HexColor("#d4edda"),
+    }
+    extra = []
+    for i, lvl in enumerate(row_colors, start=1):
+        if lvl in tint:
+            extra.append(("BACKGROUND", (9, i), (9, i), tint[lvl]))
+    t.setStyle(TableStyle(extra))
+    story.append(t)
+
+    _report_foot(story, styles, cfg)
+    doc.build(story)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# التقرير الشامل لكل المشاريع
+# ---------------------------------------------------------------------------
+
+def generate_projects_summary_pdf(projects, path, settings=None,
+                                  title="التقرير الشامل للمشاريع"):
+    """
+    projects: قائمة كائنات Project.
+    يعرض جدول المشاريع مع ملخّص مالي وتوزيع الحالات.
+    """
+    cfg = dict(settings) if settings else _load_company_settings()
+    cur = cfg.get("currency") or ""
+    styles = _styles()
+    doc = _doc(path, landscape_mode=True)
+    story = []
+
+    total_invoiced = sum(p.total_invoiced for p in projects)
+    total_unpaid = sum(p.total_unpaid for p in projects)
+
+    _report_head(
+        story, styles, cfg, title,
+        f"عدد المشاريع: {len(projects)}  |  "
+        f"إجمالي الفواتير: {total_invoiced:,.2f} {cur}  |  "
+        f"غير المسدد: {total_unpaid:,.2f} {cur}"
+    )
+
+    if not projects:
+        story.append(Paragraph(ar("لا توجد مشاريع مسجّلة."), styles["Normal"]))
+        _report_foot(story, styles, cfg)
+        doc.build(story)
+        return path
+
+    # توزيع الحالات
+    status_counts = {}
+    for p in projects:
+        key = p.status or "غير محدد"
+        status_counts[key] = status_counts.get(key, 0) + 1
+    dist = "  |  ".join(f"{k}: {v}" for k, v in status_counts.items())
+    story.append(Paragraph(ar("توزيع المشاريع حسب الحالة"), styles["SectionHeader"]))
+    story.append(Paragraph(ar(dist), styles["Normal"]))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph(ar("تفاصيل المشاريع"), styles["SectionHeader"]))
+    header = [ar(h) for h in [
+        "#", "المشروع", "العميل", "الموقع", "النطاق",
+        "الحالة", "البدء", "الانتهاء", "المعدات", "الفواتير", "غير المسدد"
+    ]]
+
+    rows = []
+    for p in projects:
+        rows.append([
+            str(p.id),
+            ar(p.name or "-"),
+            ar(p.client_name or "-"),
+            ar(p.site or "-"),
+            ar(p.scope or "-"),
+            ar(p.status or "-"),
+            str(p.start_date) if p.start_date else "—",
+            str(p.end_date) if p.end_date else "—",
+            str(len(p.equipment)),
+            f"{p.total_invoiced:,.2f}",
+            f"{p.total_unpaid:,.2f}",
+        ])
+
+    # صف الإجمالي
+    rows.append([
+        "", _cell(ar("الإجمالي"), bold=True), "", "", "", "", "", "",
+        _cell(str(sum(len(p.equipment) for p in projects)), bold=True),
+        _cell(f"{total_invoiced:,.2f}", bold=True, align=TA_RIGHT),
+        _cell(f"{total_unpaid:,.2f}", bold=True, align=TA_RIGHT),
+    ])
+
+    widths = [10 * mm, 48 * mm, 40 * mm, 26 * mm, 32 * mm,
+              20 * mm, 22 * mm, 22 * mm, 16 * mm, 24 * mm, 24 * mm]
+    t = _data_table(header, rows, widths, align_right_cols=(9, 10))
+    last = len(rows)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#e9ecef")),
+        ("FONTNAME", (0, last), (-1, last), _ARABIC_BOLD_NAME),
+    ]))
+    story.append(t)
+
+    _report_foot(story, styles, cfg)
+    doc.build(story)
+    return path
 
 
 def generate_project_report_pdf(project, path, company_name=None, settings=None):

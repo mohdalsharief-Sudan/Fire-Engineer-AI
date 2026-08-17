@@ -38,6 +38,9 @@ import reports as reports_module
 
 APP_TITLE = "FireEngineerAI — نظام إدارة مشاريع الحماية من الحريق"
 
+# مصدر واحد لحالات المشروع (كانت مكرّرة في أكثر من موضع)
+PROJECT_STATUSES = ["Design", "Supply", "Install", "Testing", "Handover"]
+
 NAV_ITEMS = [
     ("dashboard", "لوحة المعلومات"),
     ("projects", "المشاريع"),
@@ -451,7 +454,7 @@ class MainWindow(QMainWindow):
         # كان أول عنصر فارغًا تمامًا فيبدو كعطل. الآن له تسمية واضحة
         # مع الاحتفاظ بالقيمة الفارغة في الخلفية (userData) للفلترة.
         self.project_status_filter.addItem("كل الحالات", "")
-        for _st in ["Design", "Supply", "Install", "Testing", "Handover"]:
+        for _st in PROJECT_STATUSES:
             self.project_status_filter.addItem(_st, _st)
         self.project_status_filter.currentIndexChanged.connect(self.refresh_projects_table)
 
@@ -566,7 +569,7 @@ class MainWindow(QMainWindow):
         self.pf_standard.addItems(["NFPA", "EN", "BS", "SBC", "Local AHJ", "Mixed"])
 
         self.pf_status = QComboBox()
-        self.pf_status.addItems(["Design", "Supply", "Install", "Testing", "Handover"])
+        self.pf_status.addItems(PROJECT_STATUSES)
 
         self.pf_start = QDateEdit()
         self.pf_start.setCalendarPopup(True)
@@ -1493,7 +1496,7 @@ class MainWindow(QMainWindow):
     def build_reports_page(self):
         w = QWidget()
         layout = QVBoxLayout(w)
-        self.page_header(layout, "التقارير", "تصدير تقارير PDF لمشروع محدد أو ملفات CSV شاملة")
+        self.page_header(layout, "التقارير", "تقارير PDF للمشاريع والفحوصات الدورية، وتصدير CSV شامل")
 
         pdf_card, pdf_layout = make_card("تقرير PDF لمشروع")
         row = QHBoxLayout()
@@ -1505,6 +1508,43 @@ class MainWindow(QMainWindow):
         row.addWidget(gen_btn, 1)
         pdf_layout.addLayout(row)
         layout.addWidget(pdf_card)
+
+        insp_card, insp_layout = make_card("تقرير الفحوصات (للدفاع المدني)")
+        insp_row = QHBoxLayout()
+        self.insp_scope_combo = QComboBox()
+        self.insp_scope_combo.addItem("كل المعدات", "all")
+        self.insp_scope_combo.addItem("المستحقة والمتأخرة فقط (خلال 30 يومًا)", "due")
+        self.insp_scope_combo.addItem("المتأخرة فقط", "overdue")
+        self.insp_scope_combo.addItem("مشروع محدد…", "project")
+        self.insp_project_combo = QComboBox()
+        self.insp_project_combo.setEnabled(False)
+        self.insp_scope_combo.currentIndexChanged.connect(
+            lambda: self.insp_project_combo.setEnabled(
+                self.insp_scope_combo.currentData() == "project"
+            )
+        )
+        insp_btn = QPushButton("إنشاء تقرير الفحوصات")
+        insp_btn.setObjectName("PrimaryButton")
+        insp_btn.clicked.connect(self.generate_inspections_report)
+        insp_row.addWidget(self.insp_scope_combo, 3)
+        insp_row.addWidget(self.insp_project_combo, 3)
+        insp_row.addWidget(insp_btn, 2)
+        insp_layout.addLayout(insp_row)
+        layout.addWidget(insp_card)
+
+        sum_card, sum_layout = make_card("التقرير الشامل لكل المشاريع")
+        sum_row = QHBoxLayout()
+        self.summary_status_combo = QComboBox()
+        self.summary_status_combo.addItem("كل الحالات", "")
+        for _st in PROJECT_STATUSES:
+            self.summary_status_combo.addItem(_st, _st)
+        sum_btn = QPushButton("إنشاء التقرير الشامل")
+        sum_btn.setObjectName("PrimaryButton")
+        sum_btn.clicked.connect(self.generate_projects_summary_report)
+        sum_row.addWidget(self.summary_status_combo, 3)
+        sum_row.addWidget(sum_btn, 2)
+        sum_layout.addLayout(sum_row)
+        layout.addWidget(sum_card)
 
         csv_card, csv_layout = make_card("تصدير CSV")
         csv_row = QHBoxLayout()
@@ -1551,6 +1591,77 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "التقرير", f"تم إنشاء التقرير:\n{report_path}")
         QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
 
+    def _finish_report(self, report_path):
+        QMessageBox.information(self, "التقرير", f"تم إنشاء التقرير:\n{report_path}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
+
+    def generate_inspections_report(self):
+        scope = self.insp_scope_combo.currentData()
+        q = self.session.query(Equipment)
+        suffix = "All"
+
+        if scope == "project":
+            pid = self.insp_project_combo.currentData()
+            if not pid:
+                QMessageBox.information(self, "معلومة", "اختر مشروعًا أولًا.")
+                return
+            q = q.filter(Equipment.project_id == pid)
+            suffix = f"Project_{pid}"
+
+        items = q.order_by(Equipment.project_id.asc(), Equipment.id.asc()).all()
+
+        if scope == "due":
+            # المتأخرة + التي يستحق فحصها خلال 30 يومًا + غير المفحوصة أبدًا
+            items = [e for e in items if e.alert_level in ("overdue", "soon", "unknown")]
+            suffix = "Due"
+        elif scope == "overdue":
+            items = [e for e in items if e.alert_level == "overdue"]
+            suffix = "Overdue"
+
+        if not items:
+            QMessageBox.information(self, "معلومة", "لا توجد معدات مطابقة لهذا الاختيار.")
+            return
+
+        titles = {
+            "all": "تقرير الفحوصات الدورية للمعدات",
+            "due": "تقرير الفحوصات المستحقة والمتأخرة",
+            "overdue": "تقرير الفحوصات المتأخرة",
+            "project": "تقرير الفحوصات الدورية للمعدات",
+        }
+        report_path = os.path.join(REPORTS_DIR, f"Inspections_{suffix}.pdf")
+        try:
+            reports_module.generate_inspections_report_pdf(
+                items, report_path, title=titles.get(scope, titles["all"])
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر إنشاء التقرير:\n{e}")
+            return
+        self._finish_report(report_path)
+
+    def generate_projects_summary_report(self):
+        status = self.summary_status_combo.currentData()
+        q = self.session.query(Project)
+        if status:
+            q = q.filter(Project.status == status)
+        projects = q.order_by(Project.id.asc()).all()
+
+        if not projects:
+            QMessageBox.information(self, "معلومة", "لا توجد مشاريع مطابقة لهذا الاختيار.")
+            return
+
+        title = "التقرير الشامل للمشاريع"
+        if status:
+            title = f"التقرير الشامل للمشاريع — {status}"
+        report_path = os.path.join(
+            REPORTS_DIR, f"Projects_Summary_{status or 'All'}.pdf"
+        )
+        try:
+            reports_module.generate_projects_summary_pdf(projects, report_path, title=title)
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر إنشاء التقرير:\n{e}")
+            return
+        self._finish_report(report_path)
+
     def export_csv(self, kind):
         import csv as csv_module
 
@@ -1590,7 +1701,8 @@ class MainWindow(QMainWindow):
 
     def reload_project_combos(self):
         projects = self.session.query(Project).order_by(Project.id.desc()).all()
-        for combo in (self.ef_project_combo, self.if_project_combo, self.report_project_combo):
+        for combo in (self.ef_project_combo, self.if_project_combo,
+                      self.report_project_combo, self.insp_project_combo):
             current = combo.currentData()
             combo.blockSignals(True)
             combo.clear()
