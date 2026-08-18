@@ -13,13 +13,14 @@ app.py
 import os
 import shutil
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFormLayout, QLineEdit,
     QComboBox, QTextEdit, QPushButton, QDateEdit, QFileDialog,
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
     QLabel, QStackedWidget, QMessageBox, QAbstractItemView, QListWidget,
+    QCheckBox,
     QListWidgetItem, QDoubleSpinBox, QSpinBox, QScrollArea, QFrame,
     QSizePolicy, QButtonGroup, QHeaderView, QPlainTextEdit
 )
@@ -29,10 +30,13 @@ from sqlalchemy import or_
 
 from database import (
     init_db, get_session, Project, Client, Invoice, Equipment,
+    Contract, ContractVisit,
     search_projects, upcoming_inspections, unpaid_invoices, dashboard_stats,
+    search_contracts, expiring_contracts, due_contract_visits,
     ATTACHMENTS_DIR, REPORTS_DIR, BACKUPS_DIR, DB_PATH,
 )
-from theme import QSS, STATUS_COLORS, status_badge_style, alert_badge_style
+from theme import (QSS, STATUS_COLORS, status_badge_style, alert_badge_style,
+                   contract_badge_style, visit_badge_style)
 from settings import load_settings, save_settings, save_logo, clear_logo
 import reports as reports_module
 
@@ -41,12 +45,19 @@ APP_TITLE = "FireEngineerAI — نظام إدارة مشاريع الحماية 
 # مصدر واحد لحالات المشروع (كانت مكرّرة في أكثر من موضع)
 PROJECT_STATUSES = ["Design", "Supply", "Install", "Testing", "Handover"]
 
+CONTRACT_STATUSES = ["Active", "Suspended", "Cancelled"]
+CONTRACT_STATUS_AR = {"Active": "ساري", "Suspended": "موقوف", "Cancelled": "ملغى"}
+PAYMENT_CYCLES = ["سنوي", "نصف سنوي", "ربعي", "شهري", "دفعة واحدة"]
+VISIT_STATUSES = ["Scheduled", "Done", "Missed"]
+VISIT_STATUS_AR = {"Scheduled": "مجدولة", "Done": "منفّذة", "Missed": "فائتة"}
+
 NAV_ITEMS = [
     ("dashboard", "لوحة المعلومات"),
     ("projects", "المشاريع"),
     ("clients", "العملاء"),
     ("equipment", "المعدات والفحص"),
     ("invoices", "الفواتير"),
+    ("contracts", "عقود الصيانة"),
     ("reports", "التقارير"),
     ("settings", "الإعدادات"),
 ]
@@ -99,6 +110,22 @@ def set_badge_cell(table, row, col, text, style):
     lay.setContentsMargins(6, 3, 6, 3)
     lay.addWidget(label)
     table.setCellWidget(row, col, holder)
+
+
+def make_date_edit(default_today=True):
+    """
+    حقل تاريخ موحّد بصيغة yyyy-MM-dd.
+
+    الصيغة الافتراضية تتبع إعدادات ويندوز (8/18/2026 على النظام الإنجليزي)،
+    بينما الجداول والتقارير تعرض 2026-08-18 — فيختلف شكل التاريخ داخل
+    البرنامج الواحد. التوحيد يزيل اللبس بين الشهر واليوم أيضًا.
+    """
+    d = QDateEdit()
+    d.setCalendarPopup(True)
+    d.setDisplayFormat("yyyy-MM-dd")
+    if default_today:
+        d.setDate(QDate.currentDate())
+    return d
 
 
 def tune_table(table, stretch_col=None):
@@ -173,13 +200,15 @@ class MainWindow(QMainWindow):
         self.page_clients = self.build_clients_page()
         self.page_equipment = self.build_equipment_page()
         self.page_invoices = self.build_invoices_page()
+        self.page_contracts = self.build_contracts_page()
         self.page_reports = self.build_reports_page()
         self.page_settings = self.build_settings_page()
 
         for p in [
             self.page_dashboard, self.page_projects, self.page_project_form,
             self.page_project_details, self.page_clients, self.page_equipment,
-            self.page_invoices, self.page_reports, self.page_settings
+            self.page_invoices, self.page_contracts, self.page_reports,
+            self.page_settings
         ]:
             self.pages.addWidget(p)
 
@@ -217,6 +246,7 @@ class MainWindow(QMainWindow):
             "clients": self.show_clients,
             "equipment": self.show_equipment,
             "invoices": self.show_invoices,
+            "contracts": self.show_contracts,
             "reports": self.show_reports,
             "settings": self.show_settings,
         }
@@ -394,6 +424,7 @@ class MainWindow(QMainWindow):
         self.refresh_clients_table()
         self.refresh_equipment_table()
         self.refresh_invoices_table()
+        self.refresh_contracts_table()
         self.reload_client_combo()
         self.reload_project_combos()
 
@@ -405,6 +436,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "نسخ احتياطي", f"تم إنشاء نسخة احتياطية:\n{dest}")
         except Exception as e:
             QMessageBox.warning(self, "خطأ", f"تعذر إنشاء نسخة احتياطية:\n{e}")
+
+    def company_currency(self):
+        """عملة المنشأة من الإعدادات (افتراضيًا: ريال)."""
+        try:
+            return (load_settings() or {}).get("currency") or "ريال"
+        except Exception:
+            return "ريال"
 
     def safe_commit(self, action="الحفظ"):
         """
@@ -492,6 +530,18 @@ class MainWindow(QMainWindow):
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
 
+        # نموذج العقد يحتاج قائمة عملاء (العميل إلزامي هنا)
+        if hasattr(self, "cf_client_combo"):
+            cc = self.cf_client_combo
+            cur_c = cc.currentData()
+            cc.blockSignals(True)
+            cc.clear()
+            for c in clients:
+                cc.addItem(c.name, c.id)
+            i = cc.findData(cur_c)
+            cc.setCurrentIndex(i if i >= 0 else 0)
+            cc.blockSignals(False)
+
         # نموذج المشروع (إضافة/تعديل) أيضًا يحتاج قائمة عملاء
         if hasattr(self, "project_form_client_combo"):
             combo2 = self.project_form_client_combo
@@ -571,12 +621,9 @@ class MainWindow(QMainWindow):
         self.pf_status = QComboBox()
         self.pf_status.addItems(PROJECT_STATUSES)
 
-        self.pf_start = QDateEdit()
-        self.pf_start.setCalendarPopup(True)
-        self.pf_start.setDate(QDate.currentDate())
+        self.pf_start = make_date_edit()
 
-        self.pf_end = QDateEdit()
-        self.pf_end.setCalendarPopup(True)
+        self.pf_end = make_date_edit(default_today=False)
         self.pf_end.setDate(QDate.currentDate().addDays(30))
 
         self.pf_notes = QTextEdit()
@@ -1113,9 +1160,7 @@ class MainWindow(QMainWindow):
             "رأس رشاش", "صندوق خرطوم", "نظام إطفاء غازي"
         ])
         self.ef_location = QLineEdit()
-        self.ef_last_inspection = QDateEdit()
-        self.ef_last_inspection.setCalendarPopup(True)
-        self.ef_last_inspection.setDate(QDate.currentDate())
+        self.ef_last_inspection = make_date_edit()
         self.ef_interval = QSpinBox()
         self.ef_interval.setRange(1, 3650)
         self.ef_interval.setValue(180)
@@ -1323,17 +1368,16 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         self.if_project_combo = QComboBox()
+        # ربط اختياري بعقد صيانة — لمتابعة مسدَّد/غير مسدَّد لكل عقد
+        self.if_contract_combo = QComboBox()
         self.if_number = QLineEdit()
         self.if_number.setPlaceholderText("مثال: INV-2026-001")
         self.if_amount = QDoubleSpinBox()
         self.if_amount.setRange(0, 100_000_000)
         self.if_amount.setDecimals(2)
         self.if_amount.setSuffix(" ريال")
-        self.if_issue_date = QDateEdit()
-        self.if_issue_date.setCalendarPopup(True)
-        self.if_issue_date.setDate(QDate.currentDate())
-        self.if_due_date = QDateEdit()
-        self.if_due_date.setCalendarPopup(True)
+        self.if_issue_date = make_date_edit()
+        self.if_due_date = make_date_edit(default_today=False)
         self.if_due_date.setDate(QDate.currentDate().addDays(30))
         self.if_status = QComboBox()
         self.if_status.addItems(["Unpaid", "Paid"])
@@ -1341,6 +1385,7 @@ class MainWindow(QMainWindow):
         self.if_notes.setMaximumHeight(70)
 
         form.addRow("المشروع *", self.if_project_combo)
+        form.addRow("عقد الصيانة", self.if_contract_combo)
         form.addRow("رقم الفاتورة", self.if_number)
         form.addRow("المبلغ", self.if_amount)
         form.addRow("تاريخ الإصدار", self.if_issue_date)
@@ -1375,6 +1420,8 @@ class MainWindow(QMainWindow):
         self.if_save_btn.setText("حفظ")
         if self.if_project_combo.count():
             self.if_project_combo.setCurrentIndex(0)
+        if self.if_contract_combo.count():
+            self.if_contract_combo.setCurrentIndex(0)
         self.if_number.clear()
         self.if_amount.setValue(0)
         self.if_issue_date.setDate(QDate.currentDate())
@@ -1395,6 +1442,8 @@ class MainWindow(QMainWindow):
         self.if_save_btn.setText("تحديث")
         idx = self.if_project_combo.findData(i.project_id)
         self.if_project_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        cidx = self.if_contract_combo.findData(i.contract_id)
+        self.if_contract_combo.setCurrentIndex(cidx if cidx >= 0 else 0)
         self.if_number.setText(i.invoice_number or "")
         self.if_amount.setValue(i.amount or 0)
         self.if_issue_date.setDate(to_qdate(i.issue_date))
@@ -1425,6 +1474,7 @@ class MainWindow(QMainWindow):
                 return
             i.project_id = project_id
 
+        i.contract_id = self.if_contract_combo.currentData()
         i.invoice_number = self.if_number.text().strip()
         i.amount = self.if_amount.value()
         i.issue_date = self.if_issue_date.date().toPython()
@@ -1493,6 +1543,512 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Reports (PDF + CSV exports)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Contracts: عقود الصيانة السنوية
+    # ------------------------------------------------------------------
+    def build_contracts_page(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        self.page_header(layout, "عقود الصيانة السنوية",
+                         "عقود الصيانة لكل عميل مع زياراتها الدورية وربطها بالفواتير")
+
+        body = QHBoxLayout()
+
+        # ---------------- القائمة ----------------
+        list_card, list_layout = make_card()
+        top_row = QHBoxLayout()
+        self.contract_search = QLineEdit()
+        self.contract_search.setPlaceholderText("ابحث عن عقد (الرقم، العنوان، النطاق)...")
+        self.contract_search.textChanged.connect(self.refresh_contracts_table)
+        self.contract_filter_status = QComboBox()
+        self.contract_filter_status.addItem("كل الحالات", "")
+        for _s in CONTRACT_STATUSES:
+            self.contract_filter_status.addItem(CONTRACT_STATUS_AR[_s], _s)
+        self.contract_filter_status.currentIndexChanged.connect(self.refresh_contracts_table)
+        self.contract_only_expiring = QCheckBox("المنتهية وقريبة الانتهاء فقط")
+        self.contract_only_expiring.stateChanged.connect(self.refresh_contracts_table)
+        new_btn = QPushButton("+ عقد جديد")
+        new_btn.setObjectName("PrimaryButton")
+        new_btn.clicked.connect(self.new_contract_form)
+        top_row.addWidget(self.contract_search, 3)
+        top_row.addWidget(self.contract_filter_status, 1)
+        top_row.addWidget(new_btn, 1)
+        list_layout.addLayout(top_row)
+        list_layout.addWidget(self.contract_only_expiring)
+
+        self.contracts_table = QTableWidget(0, 7)
+        self.contracts_table.setHorizontalHeaderLabels(
+            ["العقد", "العميل", "الانتهاء", "المتبقي", "الزيارات", "الحالة", "السريان"]
+        )
+        self.contracts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.contracts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.contracts_table.itemClicked.connect(self.load_contract_for_edit_from_table)
+        tune_table(self.contracts_table, stretch_col=0)
+        list_layout.addWidget(self.contracts_table)
+
+        self.contracts_summary = QLabel("")
+        self.contracts_summary.setObjectName("BodyMuted")
+        list_layout.addWidget(self.contracts_summary)
+        body.addWidget(list_card, 3)
+
+        # ---------------- النموذج ----------------
+        form_card, form_layout = make_card()
+        self.contract_form_title = QLabel("عقد جديد")
+        self.contract_form_title.setObjectName("PageSubtitle")
+        form_layout.addWidget(self.contract_form_title)
+
+        form = QFormLayout()
+        self.cf_number = QLineEdit()
+        self.cf_number.setPlaceholderText("مثال: AMC-2026-001")
+        self.cf_client_combo = QComboBox()
+        self.cf_project_combo = QComboBox()
+        self.cf_title = QLineEdit()
+        self.cf_scope = QComboBox()
+        self.cf_scope.setEditable(True)
+        self.cf_scope.addItems([
+            "صيانة شاملة", "أنظمة الإنذار", "أنظمة الرشاشات",
+            "مضخات الحريق", "الطفايات اليدوية", "أنظمة الإطفاء الغازي",
+        ])
+        self.cf_start = make_date_edit()
+        self.cf_end = make_date_edit()
+        self.cf_end.setDate(QDate.currentDate().addYears(1))
+        self.cf_value = QDoubleSpinBox()
+        self.cf_value.setRange(0, 1_000_000_000); self.cf_value.setDecimals(2)
+        self.cf_value.setGroupSeparatorShown(True)
+        self.cf_cycle = QComboBox(); self.cf_cycle.addItems(PAYMENT_CYCLES)
+        self.cf_visits = QSpinBox(); self.cf_visits.setRange(0, 365); self.cf_visits.setValue(4)
+        self.cf_visits.setSuffix(" زيارة/سنة")
+        self.cf_status = QComboBox()
+        for _s in CONTRACT_STATUSES:
+            self.cf_status.addItem(CONTRACT_STATUS_AR[_s], _s)
+        self.cf_notes = QTextEdit(); self.cf_notes.setMaximumHeight(60)
+
+        form.addRow("رقم العقد", self.cf_number)
+        form.addRow("العميل *", self.cf_client_combo)
+        form.addRow("المشروع/الموقع", self.cf_project_combo)
+        form.addRow("عنوان العقد", self.cf_title)
+        form.addRow("نطاق الصيانة", self.cf_scope)
+        form.addRow("تاريخ البدء", self.cf_start)
+        form.addRow("تاريخ الانتهاء", self.cf_end)
+        form.addRow("القيمة السنوية", self.cf_value)
+        form.addRow("دورة الدفع", self.cf_cycle)
+        form.addRow("عدد الزيارات", self.cf_visits)
+        form.addRow("الحالة", self.cf_status)
+        form.addRow("ملاحظات", self.cf_notes)
+        form_layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.cf_save_btn = QPushButton("حفظ")
+        self.cf_save_btn.setObjectName("PrimaryButton")
+        self.cf_save_btn.clicked.connect(self.save_contract_form)
+        clear_btn = QPushButton("جديد")
+        clear_btn.clicked.connect(self.new_contract_form)
+        del_btn = QPushButton("حذف")
+        del_btn.setObjectName("DangerButton")
+        del_btn.clicked.connect(self.delete_current_contract)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(del_btn)
+        btn_row.addWidget(self.cf_save_btn)
+        form_layout.addLayout(btn_row)
+
+        # ---------------- الزيارات ----------------
+        self.visits_box = QWidget()
+        vbox = QVBoxLayout(self.visits_box)
+        vbox.setContentsMargins(0, 8, 0, 0)
+        vlabel = QLabel("زيارات الصيانة")
+        vlabel.setObjectName("PageSubtitle")
+        vbox.addWidget(vlabel)
+
+        self.visits_table = QTableWidget(0, 4)
+        self.visits_table.setHorizontalHeaderLabels(["التاريخ", "الفني", "الحالة", "ملاحظات"])
+        self.visits_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.visits_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.visits_table.setMaximumHeight(170)
+        self.visits_table.itemClicked.connect(self.load_visit_for_edit)
+        tune_table(self.visits_table, stretch_col=3)
+        vbox.addWidget(self.visits_table)
+
+        vrow = QHBoxLayout()
+        self.vf_date = make_date_edit()
+        self.vf_tech = QLineEdit(); self.vf_tech.setPlaceholderText("الفني")
+        self.vf_status = QComboBox()
+        for _s in VISIT_STATUSES:
+            self.vf_status.addItem(VISIT_STATUS_AR[_s], _s)
+        vrow.addWidget(self.vf_date, 2)
+        vrow.addWidget(self.vf_tech, 2)
+        vrow.addWidget(self.vf_status, 1)
+        vbox.addLayout(vrow)
+
+        self.vf_notes = QLineEdit()
+        self.vf_notes.setPlaceholderText("ملاحظات الزيارة / ما تم عمله")
+        vbox.addWidget(self.vf_notes)
+
+        vbtns = QHBoxLayout()
+        self.vf_save_btn = QPushButton("إضافة زيارة")
+        self.vf_save_btn.clicked.connect(self.save_visit_form)
+        vf_new_btn = QPushButton("مسح")
+        vf_new_btn.clicked.connect(self.new_visit_form)
+        vf_del_btn = QPushButton("حذف الزيارة")
+        vf_del_btn.setObjectName("DangerButton")
+        vf_del_btn.clicked.connect(self.delete_current_visit)
+        self.vf_plan_btn = QPushButton("جدولة تلقائية")
+        self.vf_plan_btn.setToolTip("توليد زيارات موزّعة بالتساوي على مدة العقد")
+        self.vf_plan_btn.clicked.connect(self.auto_schedule_visits)
+        vbtns.addWidget(vf_new_btn)
+        vbtns.addWidget(self.vf_plan_btn)
+        vbtns.addStretch()
+        vbtns.addWidget(vf_del_btn)
+        vbtns.addWidget(self.vf_save_btn)
+        vbox.addLayout(vbtns)
+
+        form_layout.addWidget(self.visits_box)
+
+        pdf_row = QHBoxLayout()
+        cert_btn = QPushButton("شهادة العقد PDF")
+        cert_btn.clicked.connect(self.generate_contract_certificate)
+        pdf_row.addWidget(cert_btn)
+        form_layout.addLayout(pdf_row)
+
+        form_layout.addStretch()
+        body.addWidget(form_card, 2)
+        layout.addLayout(body)
+
+        self.current_edit_contract_id = None
+        self.current_edit_visit_id = None
+        return w
+
+    # ---------------- منطق العقود ----------------
+
+    def new_contract_form(self):
+        self.current_edit_contract_id = None
+        self.contract_form_title.setText("عقد جديد")
+        self.cf_save_btn.setText("حفظ")
+        self.cf_number.clear()
+        if self.cf_client_combo.count():
+            self.cf_client_combo.setCurrentIndex(0)
+        if self.cf_project_combo.count():
+            self.cf_project_combo.setCurrentIndex(0)
+        self.cf_title.clear()
+        self.cf_scope.setCurrentIndex(0)
+        self.cf_start.setDate(QDate.currentDate())
+        self.cf_end.setDate(QDate.currentDate().addYears(1))
+        self.cf_value.setValue(0)
+        self.cf_cycle.setCurrentIndex(0)
+        self.cf_visits.setValue(4)
+        self.cf_status.setCurrentIndex(0)
+        self.cf_notes.clear()
+        self.new_visit_form()
+        self.refresh_visits_table()
+
+    def load_contract_for_edit_from_table(self, item):
+        row = item.row()
+        cid = self.contracts_table.item(row, 0).data(Qt.UserRole)
+        if cid is None:
+            return
+        c = self.session.query(Contract).filter(Contract.id == cid).first()
+        if not c:
+            return
+        self.current_edit_contract_id = c.id
+        self.contract_form_title.setText(f"تعديل عقد #{c.id}")
+        self.cf_save_btn.setText("تحديث")
+        self.cf_number.setText(c.contract_number or "")
+        idx = self.cf_client_combo.findData(c.client_id)
+        self.cf_client_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        idx = self.cf_project_combo.findData(c.project_id)
+        self.cf_project_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cf_title.setText(c.title or "")
+        self.cf_scope.setCurrentText(c.scope or "")
+        self.cf_start.setDate(to_qdate(c.start_date))
+        self.cf_end.setDate(to_qdate(c.end_date))
+        self.cf_value.setValue(c.value or 0)
+        self.cf_cycle.setCurrentText(c.payment_cycle or PAYMENT_CYCLES[0])
+        self.cf_visits.setValue(c.visits_per_year or 0)
+        i = self.cf_status.findData(c.status)
+        self.cf_status.setCurrentIndex(i if i >= 0 else 0)
+        self.cf_notes.setPlainText(c.notes or "")
+        self.new_visit_form()
+        self.refresh_visits_table()
+
+    def save_contract_form(self):
+        client_id = self.cf_client_combo.currentData()
+        if not client_id:
+            if self.cf_client_combo.count() == 0:
+                QMessageBox.warning(
+                    self, "لا يوجد عملاء",
+                    "لا يمكن إنشاء عقد قبل إضافة عميل.\n"
+                    "أضف عميلًا أولًا من صفحة العملاء ثم عد إلى هنا."
+                )
+            else:
+                QMessageBox.warning(self, "تنبيه", "الرجاء اختيار العميل.")
+            return
+
+        start = self.cf_start.date().toPython()
+        end = self.cf_end.date().toPython()
+        if end < start:
+            QMessageBox.warning(self, "تنبيه",
+                                "تاريخ الانتهاء يسبق تاريخ البدء. صحّح التواريخ.")
+            return
+
+        if self.current_edit_contract_id is None:
+            c = Contract(client_id=client_id)
+            self.session.add(c)
+        else:
+            c = self.session.query(Contract).filter(
+                Contract.id == self.current_edit_contract_id).first()
+            if not c:
+                QMessageBox.warning(self, "تنبيه", "العقد غير موجود.")
+                return
+            c.client_id = client_id
+
+        c.contract_number = self.cf_number.text().strip()
+        c.project_id = self.cf_project_combo.currentData()
+        c.title = self.cf_title.text().strip()
+        c.scope = self.cf_scope.currentText().strip()
+        c.start_date = start
+        c.end_date = end
+        c.value = self.cf_value.value()
+        c.payment_cycle = self.cf_cycle.currentText()
+        c.visits_per_year = self.cf_visits.value()
+        c.status = self.cf_status.currentData()
+        c.notes = self.cf_notes.toPlainText().strip()
+
+        if not self.safe_commit("حفظ العقد"):
+            return
+        self.current_edit_contract_id = c.id
+        QMessageBox.information(self, "تم الحفظ", f"تم حفظ العقد #{c.id} بنجاح.")
+        self.refresh_all()
+        self.contract_form_title.setText(f"تعديل عقد #{c.id}")
+        self.cf_save_btn.setText("تحديث")
+
+    def delete_current_contract(self):
+        if self.current_edit_contract_id is None:
+            QMessageBox.information(self, "معلومة", "اختر عقدًا من القائمة أولًا.")
+            return
+        c = self.session.query(Contract).filter(
+            Contract.id == self.current_edit_contract_id).first()
+        if not c:
+            return
+        n_inv = len(c.invoices)
+        extra = (f"\nملاحظة: مرتبط به {n_inv} فاتورة — لن تُحذف الفواتير، "
+                 "سيُلغى ارتباطها بالعقد فقط." if n_inv else "")
+        reply = QMessageBox.question(
+            self, "تأكيد الحذف",
+            f"حذف العقد '{c.title or c.contract_number or c.id}' "
+            f"وكل زياراته ({len(c.visits)})؟{extra}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        # فك ارتباط الفواتير يدويًا حتى لا تفشل القيود
+        for inv in list(c.invoices):
+            inv.contract_id = None
+        self.session.delete(c)
+        if not self.safe_commit("حذف العقد"):
+            return
+        QMessageBox.information(self, "تم الحذف", "تم حذف العقد.")
+        self.refresh_all()
+        self.new_contract_form()
+
+    def refresh_contracts_table(self):
+        if not hasattr(self, "contracts_table"):
+            return
+        text = self.contract_search.text().strip()
+        status = self.contract_filter_status.currentData() or ""
+        only_exp = self.contract_only_expiring.isChecked()
+        rows = search_contracts(self.session, text=text, status=status,
+                                only_expiring=only_exp)
+
+        self.contracts_table.setRowCount(0)
+        for c in rows:
+            row = self.contracts_table.rowCount()
+            self.contracts_table.insertRow(row)
+            label = c.title or c.contract_number or f"عقد #{c.id}"
+            item = QTableWidgetItem(label)
+            item.setData(Qt.UserRole, c.id)
+            self.contracts_table.setItem(row, 0, item)
+            self.contracts_table.setItem(row, 1, QTableWidgetItem(c.client_name or "—"))
+            self.contracts_table.setItem(
+                row, 2, QTableWidgetItem(str(c.end_date) if c.end_date else "—"))
+
+            d = c.days_remaining
+            if d is None:
+                rem = "—"
+            elif d < 0:
+                rem = f"منتهٍ ({abs(d)} يوم)"
+            else:
+                rem = f"{d} يوم"
+            self.contracts_table.setItem(row, 3, QTableWidgetItem(rem))
+            self.contracts_table.setItem(
+                row, 4, QTableWidgetItem(f"{c.visits_done}/{c.visits_per_year or 0}"))
+            set_badge_cell(self.contracts_table, row, 5,
+                           CONTRACT_STATUS_AR.get(c.status, c.status or "—"),
+                           contract_badge_style(c.status or ""))
+            lvl = c.alert_level
+            txt = {"expired": "منتهٍ", "soon": "قريب الانتهاء",
+                   "none": "ساري", "unknown": "بلا تاريخ",
+                   "inactive": "غير مفعّل"}.get(lvl, "—")
+            set_badge_cell(self.contracts_table, row, 6, txt, alert_badge_style(lvl))
+
+        active = [c for c in rows if c.is_active]
+        total_val = sum(c.value or 0 for c in active)
+        cur = self.company_currency()
+        self.contracts_summary.setText(
+            f"المعروض: {len(rows)} عقد  |  الساري فعليًا: {len(active)}  |  "
+            f"إجمالي قيمة العقود السارية: {total_val:,.2f} {cur}"
+        )
+
+    # ---------------- منطق الزيارات ----------------
+
+    def _current_contract(self):
+        if self.current_edit_contract_id is None:
+            return None
+        return self.session.query(Contract).filter(
+            Contract.id == self.current_edit_contract_id).first()
+
+    def new_visit_form(self):
+        self.current_edit_visit_id = None
+        self.vf_save_btn.setText("إضافة زيارة")
+        self.vf_date.setDate(QDate.currentDate())
+        self.vf_tech.clear()
+        self.vf_status.setCurrentIndex(0)
+        self.vf_notes.clear()
+
+    def refresh_visits_table(self):
+        if not hasattr(self, "visits_table"):
+            return
+        self.visits_table.setRowCount(0)
+        c = self._current_contract()
+        if not c:
+            return
+        for v in c.visits:
+            row = self.visits_table.rowCount()
+            self.visits_table.insertRow(row)
+            it = QTableWidgetItem(str(v.visit_date) if v.visit_date else "—")
+            it.setData(Qt.UserRole, v.id)
+            self.visits_table.setItem(row, 0, it)
+            self.visits_table.setItem(row, 1, QTableWidgetItem(v.technician or "—"))
+            label = VISIT_STATUS_AR.get(v.status, v.status or "—")
+            if v.is_overdue:
+                label = "متأخرة"
+            set_badge_cell(self.visits_table, row, 2, label,
+                           visit_badge_style("Missed" if v.is_overdue else (v.status or "")))
+            self.visits_table.setItem(row, 3, QTableWidgetItem(v.notes or v.findings or ""))
+
+    def load_visit_for_edit(self, item):
+        row = item.row()
+        vid = self.visits_table.item(row, 0).data(Qt.UserRole)
+        if vid is None:
+            return
+        v = self.session.query(ContractVisit).filter(ContractVisit.id == vid).first()
+        if not v:
+            return
+        self.current_edit_visit_id = v.id
+        self.vf_save_btn.setText("تحديث الزيارة")
+        self.vf_date.setDate(to_qdate(v.visit_date))
+        self.vf_tech.setText(v.technician or "")
+        i = self.vf_status.findData(v.status)
+        self.vf_status.setCurrentIndex(i if i >= 0 else 0)
+        self.vf_notes.setText(v.notes or "")
+
+    def save_visit_form(self):
+        c = self._current_contract()
+        if not c:
+            QMessageBox.information(
+                self, "معلومة",
+                "احفظ العقد أولًا (أو اختر عقدًا من القائمة) قبل إضافة الزيارات.")
+            return
+        if self.current_edit_visit_id is None:
+            v = ContractVisit(contract_id=c.id)
+            self.session.add(v)
+        else:
+            v = self.session.query(ContractVisit).filter(
+                ContractVisit.id == self.current_edit_visit_id).first()
+            if not v:
+                return
+        v.visit_date = self.vf_date.date().toPython()
+        v.technician = self.vf_tech.text().strip()
+        v.status = self.vf_status.currentData()
+        v.notes = self.vf_notes.text().strip()
+        if not self.safe_commit("حفظ الزيارة"):
+            return
+        self.new_visit_form()
+        self.refresh_visits_table()
+        self.refresh_contracts_table()
+        self.refresh_dashboard()
+
+    def delete_current_visit(self):
+        if self.current_edit_visit_id is None:
+            QMessageBox.information(self, "معلومة", "اختر زيارة من الجدول أولًا.")
+            return
+        v = self.session.query(ContractVisit).filter(
+            ContractVisit.id == self.current_edit_visit_id).first()
+        if not v:
+            return
+        if QMessageBox.question(self, "تأكيد الحذف", "حذف هذه الزيارة؟",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.session.delete(v)
+        if not self.safe_commit("حذف الزيارة"):
+            return
+        self.new_visit_form()
+        self.refresh_visits_table()
+        self.refresh_contracts_table()
+        self.refresh_dashboard()
+
+    def auto_schedule_visits(self):
+        """يولّد زيارات موزّعة بالتساوي على مدة العقد."""
+        c = self._current_contract()
+        if not c:
+            QMessageBox.information(self, "معلومة", "احفظ العقد أولًا.")
+            return
+        n = c.visits_per_year or 0
+        if n <= 0:
+            QMessageBox.warning(self, "تنبيه", "حدّد عدد الزيارات في العقد أولًا.")
+            return
+        if not (c.start_date and c.end_date):
+            QMessageBox.warning(self, "تنبيه", "حدّد تاريخي البدء والانتهاء أولًا.")
+            return
+        if c.visits:
+            if QMessageBox.question(
+                self, "تأكيد",
+                f"يوجد {len(c.visits)} زيارة مسجّلة.\n"
+                "سيتم حذف الزيارات المجدولة غير المنفّذة واستبدالها بجدول جديد.\n"
+                "(الزيارات المنفّذة لن تُحذف). المتابعة؟",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                return
+            for v in list(c.visits):
+                if v.status == "Scheduled":
+                    self.session.delete(v)
+
+        span = (c.end_date - c.start_date).days
+        step = max(1, span // n)
+        for i in range(n):
+            d = c.start_date + timedelta(days=step * i)
+            if d > c.end_date:
+                d = c.end_date
+            self.session.add(ContractVisit(contract_id=c.id, visit_date=d,
+                                           status="Scheduled"))
+        if not self.safe_commit("جدولة الزيارات"):
+            return
+        QMessageBox.information(self, "تمت الجدولة",
+                                f"تم إنشاء {n} زيارة موزّعة على مدة العقد.")
+        self.refresh_visits_table()
+        self.refresh_contracts_table()
+        self.refresh_dashboard()
+
+    def generate_contract_certificate(self):
+        c = self._current_contract()
+        if not c:
+            QMessageBox.information(self, "معلومة", "اختر عقدًا من القائمة أولًا.")
+            return
+        path = os.path.join(REPORTS_DIR, f"Contract_{c.id}.pdf")
+        try:
+            reports_module.generate_contract_certificate_pdf(c, path)
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر إنشاء الشهادة:\n{e}")
+            return
+        self._finish_report(path)
+
     def build_reports_page(self):
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -1545,6 +2101,20 @@ class MainWindow(QMainWindow):
         sum_row.addWidget(sum_btn, 2)
         sum_layout.addLayout(sum_row)
         layout.addWidget(sum_card)
+
+        contracts_card, contracts_layout = make_card("كشف عقود الصيانة")
+        ct_row = QHBoxLayout()
+        self.contracts_report_scope = QComboBox()
+        self.contracts_report_scope.addItem("كل العقود", "all")
+        self.contracts_report_scope.addItem("السارية فقط", "active")
+        self.contracts_report_scope.addItem("المنتهية وقريبة الانتهاء", "expiring")
+        ct_btn = QPushButton("إنشاء كشف العقود")
+        ct_btn.setObjectName("PrimaryButton")
+        ct_btn.clicked.connect(self.generate_contracts_report)
+        ct_row.addWidget(self.contracts_report_scope, 3)
+        ct_row.addWidget(ct_btn, 2)
+        contracts_layout.addLayout(ct_row)
+        layout.addWidget(contracts_card)
 
         csv_card, csv_layout = make_card("تصدير CSV")
         csv_row = QHBoxLayout()
@@ -1662,6 +2232,30 @@ class MainWindow(QMainWindow):
             return
         self._finish_report(report_path)
 
+    def generate_contracts_report(self):
+        scope = self.contracts_report_scope.currentData()
+        items = self.session.query(Contract).order_by(Contract.id.asc()).all()
+        titles = {"all": "كشف عقود الصيانة السنوية",
+                  "active": "كشف عقود الصيانة السارية",
+                  "expiring": "عقود الصيانة المنتهية وقريبة الانتهاء"}
+        if scope == "active":
+            items = [c for c in items if c.is_active]
+        elif scope == "expiring":
+            items = [c for c in items if c.alert_level in ("expired", "soon")]
+
+        if not items:
+            QMessageBox.information(self, "معلومة", "لا توجد عقود مطابقة لهذا الاختيار.")
+            return
+
+        path = os.path.join(REPORTS_DIR, f"Contracts_{scope}.pdf")
+        try:
+            reports_module.generate_contracts_report_pdf(
+                items, path, title=titles.get(scope, titles["all"]))
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر إنشاء الكشف:\n{e}")
+            return
+        self._finish_report(path)
+
     def export_csv(self, kind):
         import csv as csv_module
 
@@ -1701,6 +2295,35 @@ class MainWindow(QMainWindow):
 
     def reload_project_combos(self):
         projects = self.session.query(Project).order_by(Project.id.desc()).all()
+        # قائمة عقود الصيانة في نموذج الفاتورة (اختياري)
+        if hasattr(self, "if_contract_combo"):
+            ic = self.if_contract_combo
+            cur_ct = ic.currentData()
+            ic.blockSignals(True)
+            ic.clear()
+            ic.addItem("— بدون عقد —", None)
+            for ct in self.session.query(Contract).order_by(Contract.id.desc()).all():
+                lbl = ct.title or ct.contract_number or f"عقد #{ct.id}"
+                if ct.client_name:
+                    lbl = f"{lbl} — {ct.client_name}"
+                ic.addItem(lbl, ct.id)
+            i2 = ic.findData(cur_ct)
+            ic.setCurrentIndex(i2 if i2 >= 0 else 0)
+            ic.blockSignals(False)
+
+        # نموذج العقد: المشروع اختياري، فله خيار "بدون تحديد" في المقدمة
+        if hasattr(self, "cf_project_combo"):
+            cp = self.cf_project_combo
+            cur_p = cp.currentData()
+            cp.blockSignals(True)
+            cp.clear()
+            cp.addItem("— كل مواقع العميل —", None)
+            for p in projects:
+                cp.addItem(f"#{p.id} — {p.name}", p.id)
+            i = cp.findData(cur_p)
+            cp.setCurrentIndex(i if i >= 0 else 0)
+            cp.blockSignals(False)
+
         for combo in (self.ef_project_combo, self.if_project_combo,
                       self.report_project_combo, self.insp_project_combo):
             current = combo.currentData()
@@ -1738,6 +2361,12 @@ class MainWindow(QMainWindow):
         self.refresh_invoices_table()
         self.pages.setCurrentWidget(self.page_invoices)
         self.statusBar().showMessage("الفواتير")
+
+    def show_contracts(self):
+        self.set_active_nav("contracts")
+        self.refresh_contracts_table()
+        self.pages.setCurrentWidget(self.page_contracts)
+        self.statusBar().showMessage("عقود الصيانة السنوية")
 
     def show_reports(self):
         self.set_active_nav("reports")

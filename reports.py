@@ -367,6 +367,187 @@ def _report_foot(story, styles, cfg):
 # تقرير الفحوصات الدورية (للدفاع المدني / متابعة الصيانة)
 # ---------------------------------------------------------------------------
 
+def generate_contracts_report_pdf(contracts, path, settings=None,
+                                  title="كشف عقود الصيانة السنوية"):
+    """كشف بكل عقود الصيانة مع حالة السريان والزيارات والقيم المالية."""
+    cfg = dict(settings) if settings else _load_company_settings()
+    styles = _styles()
+    doc = _doc(path, landscape_mode=True)
+    story = []
+    cur = cfg.get("currency") or "ريال"
+
+    total_value = sum(c.value or 0 for c in contracts)
+    active = [c for c in contracts if c.is_active]
+    expired = [c for c in contracts if c.alert_level == "expired"]
+    soon = [c for c in contracts if c.alert_level == "soon"]
+
+    subtitle = (f"إجمالي العقود: {len(contracts)}  |  السارية: {len(active)}  |  "
+                f"قريبة الانتهاء: {len(soon)}  |  منتهية: {len(expired)}  |  "
+                f"إجمالي القيم: {total_value:,.2f} {cur}")
+    _report_head(story, styles, cfg, title, subtitle)
+
+    header = [ar(h) for h in [
+        "م", "رقم العقد", "العنوان", "العميل", "الموقع/المشروع", "النطاق",
+        "البدء", "الانتهاء", "المتبقي", "الزيارات", "القيمة", "الحالة",
+    ]]
+
+    rows = []
+    for idx, c in enumerate(contracts, start=1):
+        d = c.days_remaining
+        if d is None:
+            rem = "—"
+        elif d < 0:
+            rem = ar(f"منتهٍ ({abs(d)} يوم)")
+        else:
+            rem = ar(f"{d} يوم")
+
+        status_ar = {"Active": "ساري", "Suspended": "موقوف",
+                     "Cancelled": "ملغى"}.get(c.status, c.status or "—")
+
+        rows.append([
+            str(idx),
+            ar(c.contract_number or "—"),
+            ar(c.title or "—"),
+            ar(c.client_name or "—"),
+            ar(c.project_name or "كل المواقع"),
+            ar(c.scope or "—"),
+            str(c.start_date) if c.start_date else "—",
+            str(c.end_date) if c.end_date else "—",
+            rem,
+            f"{c.visits_done}/{c.visits_per_year or 0}",
+            f"{(c.value or 0):,.2f}",
+            ar(status_ar),
+        ])
+
+    widths = [9 * mm, 24 * mm, 40 * mm, 36 * mm, 30 * mm, 26 * mm,
+              20 * mm, 20 * mm, 24 * mm, 16 * mm, 24 * mm, 16 * mm]
+    t = _data_table(header, rows, widths, align_right_cols=(10,))
+
+    # تلوين عمود المتبقي حسب حالة السريان
+    extra = []
+    for i, c in enumerate(contracts, start=1):
+        lvl = c.alert_level
+        bg = {"expired": colors.HexColor("#f8d7da"),
+              "soon": colors.HexColor("#fff3cd"),
+              "unknown": colors.HexColor("#e9ecef"),
+              "inactive": colors.HexColor("#e9ecef"),
+              "none": colors.HexColor("#d4edda")}.get(lvl)
+        if bg is not None:
+            extra.append(("BACKGROUND", (8, i), (8, i), bg))
+    if extra:
+        t.setStyle(TableStyle(extra))
+    story.append(t)
+
+    story.append(Spacer(1, 8 * mm))
+    story.append(Paragraph(ar("الملخّص المالي"), styles["SectionHeader"]))
+    paid = sum(c.total_invoiced - c.total_unpaid for c in contracts)
+    unpaid = sum(c.total_unpaid for c in contracts)
+    story.append(Paragraph(
+        ar(f"إجمالي قيمة العقود: {total_value:,.2f} {cur}  |  "
+           f"المفوتر: {sum(c.total_invoiced for c in contracts):,.2f} {cur}  |  "
+           f"المحصّل: {paid:,.2f} {cur}  |  غير المسدَّد: {unpaid:,.2f} {cur}"),
+        styles["Normal"]))
+
+    _report_foot(story, styles, cfg)
+    doc.build(story)
+    return path
+
+
+def generate_contract_certificate_pdf(contract, path, settings=None):
+    """تقرير تفصيلي لعقد واحد يصلح للتسليم للعميل."""
+    cfg = dict(settings) if settings else _load_company_settings()
+    styles = _styles()
+    doc = _doc(path)
+    story = []
+    cur = cfg.get("currency") or "ريال"
+    c = contract
+
+    heading = c.title or c.contract_number or f"عقد #{c.id}"
+    _report_head(story, styles, cfg, "عقد صيانة سنوي", heading)
+
+    status_ar = {"Active": "ساري", "Suspended": "موقوف",
+                 "Cancelled": "ملغى"}.get(c.status, c.status or "—")
+    d = c.days_remaining
+    if d is None:
+        rem = "—"
+    elif d < 0:
+        rem = f"منتهٍ منذ {abs(d)} يوم"
+    else:
+        rem = f"{d} يوم"
+
+    story.append(Paragraph(ar("بيانات العقد"), styles["SectionHeader"]))
+    story.append(_kv_table([
+        ("رقم العقد", c.contract_number or "—"),
+        ("العميل", c.client_name or "—"),
+        ("الموقع/المشروع", c.project_name or "كل مواقع العميل"),
+        ("نطاق الصيانة", c.scope or "—"),
+        ("تاريخ البدء", str(c.start_date) if c.start_date else "—"),
+        ("تاريخ الانتهاء", str(c.end_date) if c.end_date else "—"),
+        ("المدة المتبقية", rem),
+        ("الحالة", status_ar),
+    ]))
+
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph(ar("البنود المالية"), styles["SectionHeader"]))
+    story.append(_kv_table([
+        ("القيمة السنوية", f"{(c.value or 0):,.2f} {cur}"),
+        ("دورة الدفع", c.payment_cycle or "—"),
+        ("إجمالي المفوتر", f"{c.total_invoiced:,.2f} {cur}"),
+        ("غير المسدَّد", f"{c.total_unpaid:,.2f} {cur}"),
+    ]))
+
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph(ar("الزيارات الدورية"), styles["SectionHeader"]))
+    story.append(Paragraph(
+        ar(f"المتعاقد عليه: {c.visits_per_year or 0} زيارة سنويًا  |  "
+           f"المنفّذة: {c.visits_done}  |  المتبقية: {c.visits_remaining}"),
+        styles["BodyMuted"]))
+    story.append(Spacer(1, 2 * mm))
+
+    if c.visits:
+        vheader = [ar(h) for h in ["م", "التاريخ", "الفني", "الحالة", "ملاحظات"]]
+        vrows = []
+        for i, v in enumerate(c.visits, start=1):
+            st = {"Scheduled": "مجدولة", "Done": "منفّذة",
+                  "Missed": "فائتة"}.get(v.status, v.status or "—")
+            if v.is_overdue:
+                st = "متأخرة"
+            vrows.append([
+                str(i),
+                str(v.visit_date) if v.visit_date else "—",
+                ar(v.technician or "—"),
+                ar(st),
+                ar(v.notes or v.findings or "—"),
+            ])
+        vt = _data_table(vheader, vrows,
+                         [10 * mm, 26 * mm, 34 * mm, 24 * mm, 76 * mm])
+        extra = []
+        for i, v in enumerate(c.visits, start=1):
+            if v.status == "Done":
+                bg = colors.HexColor("#d4edda")
+            elif v.is_overdue or v.status == "Missed":
+                bg = colors.HexColor("#f8d7da")
+            else:
+                bg = None
+            if bg is not None:
+                extra.append(("BACKGROUND", (3, i), (3, i), bg))
+        if extra:
+            vt.setStyle(TableStyle(extra))
+        story.append(vt)
+    else:
+        story.append(Paragraph(ar("لا توجد زيارات مسجّلة لهذا العقد."),
+                               styles["BodyMuted"]))
+
+    if c.notes:
+        story.append(Spacer(1, 5 * mm))
+        story.append(Paragraph(ar("ملاحظات"), styles["SectionHeader"]))
+        story.append(Paragraph(ar(c.notes), styles["Normal"]))
+
+    _report_foot(story, styles, cfg)
+    doc.build(story)
+    return path
+
+
 def generate_inspections_report_pdf(equipment_list, path, settings=None,
                                     title="تقرير الفحوصات الدورية للمعدات"):
     """

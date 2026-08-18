@@ -31,6 +31,22 @@ ALERT_COLORS = {
     "soon": WARNING,
     "none": SUCCESS,
     "unknown": "#7a8699",   # معدة لم يُسجَّل لها تاريخ فحص إطلاقًا
+    "expired": DANGER,      # عقد صيانة منتهٍ
+    "inactive": TEXT_MUTED, # عقد موقوف أو ملغى
+}
+
+# حالات عقد الصيانة
+CONTRACT_STATUS_COLORS = {
+    "Active": SUCCESS,
+    "Suspended": WARNING,
+    "Cancelled": TEXT_MUTED,
+}
+
+# حالات زيارة الصيانة
+VISIT_STATUS_COLORS = {
+    "Scheduled": "#5b8def",
+    "Done": SUCCESS,
+    "Missed": DANGER,
 }
 
 QSS = f"""
@@ -41,7 +57,8 @@ QSS = f"""
 QMainWindow, QWidget {{
     background-color: {BG};
     color: {TEXT};
-    font-family: "Segoe UI", "Tahoma", sans-serif;
+    /* Tahoma أولًا: مقاييسه العربية أدق من Segoe UI ولا تُقصّ الأذناب */
+    font-family: "Tahoma", "Segoe UI", "Arial", sans-serif;
     font-size: 13px;
 }}
 
@@ -120,9 +137,22 @@ QLineEdit, QTextEdit, QDateEdit, QComboBox, QDoubleSpinBox, QSpinBox {{
     background-color: {SURFACE};
     border: 1px solid {BORDER};
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 7px 10px;
+    /* بدون min-height يُحسب ارتفاع الحقل على المقاييس اللاتينية، فتُقصّ
+       أذناب الحروف العربية (ر و ي ج) ويظهر النص مشوّهًا: "صيانة شاملة"
+       تبدو "صبانة شاماة" و"سنوي" تبدو "سنه،". */
+    min-height: 24px;
     color: {TEXT};
     selection-background-color: {ACCENT};
+}}
+
+/* حقول التاريخ والأرقام فيها أزرار داخلية تضغط النص — تحتاج مساحة أكبر */
+QDateEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+    min-height: 26px;
+}}
+
+QTextEdit {{
+    min-height: 48px;
 }}
 
 QLineEdit:focus, QTextEdit:focus, QDateEdit:focus, QComboBox:focus {{
@@ -228,6 +258,10 @@ QScrollBar:vertical {{
     background: {BG};
     width: 10px;
 }}
+QTableWidget::item {{
+    padding: 4px 6px;
+}}
+
 QScrollBar::handle:vertical {{
     background: {BORDER};
     border-radius: 5px;
@@ -272,4 +306,14 @@ def status_badge_style(status: str) -> str:
 
 def alert_badge_style(level: str) -> str:
     color = ALERT_COLORS.get(level, TEXT_MUTED)
+    return f"background-color:{color}22; color:{color}; border:1px solid {color}; border-radius:8px; padding:2px 10px; font-weight:600;"
+
+
+def contract_badge_style(status: str) -> str:
+    color = CONTRACT_STATUS_COLORS.get(status, TEXT_MUTED)
+    return f"background-color:{color}22; color:{color}; border:1px solid {color}; border-radius:8px; padding:2px 10px; font-weight:600;"
+
+
+def visit_badge_style(status: str) -> str:
+    color = VISIT_STATUS_COLORS.get(status, TEXT_MUTED)
     return f"background-color:{color}22; color:{color}; border:1px solid {color}; border-radius:8px; padding:2px 10px; font-weight:600;"
