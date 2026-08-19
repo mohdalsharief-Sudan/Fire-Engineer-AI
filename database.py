@@ -117,7 +117,11 @@ class Invoice(Base):
 
     @property
     def is_overdue(self):
-        return self.status != "Paid" and self.due_date and self.due_date < date.today()
+        # bool() مقصودة: تعبير "and" يعيد المعامل الزائف نفسه، فكانت الخاصية
+        # تعيد None (لا False) حين لا يوجد تاريخ استحقاق — فيظهر "None" في
+        # تصدير CSV وتفشل أي مقارنة صارمة (is False).
+        return bool(self.status != "Paid" and self.due_date
+                    and self.due_date < date.today())
 
 
 class Equipment(Base):
@@ -288,8 +292,8 @@ class ContractVisit(Base):
     @property
     def is_overdue(self):
         """زيارة مجدولة فات موعدها ولم تُنفَّذ."""
-        return (self.status == "Scheduled" and self.visit_date
-                and self.visit_date < date.today())
+        return bool(self.status == "Scheduled" and self.visit_date
+                    and self.visit_date < date.today())
 
 
 def _needs_legacy_migration():

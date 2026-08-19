@@ -2644,7 +2644,8 @@ class MainWindow(QMainWindow):
 
 def _app_icon():
     """أيقونة البرنامج (تظهر في شريط العنوان وشريط المهام)."""
-    base = os.path.dirname(os.path.abspath(__file__))
+    # sys._MEIPASS: مجلد الفكّ المؤقت حين يعمل البرنامج كملف exe مُجمَّع.
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
     for name in ("app_icon.ico", "app_icon.png"):
         p = os.path.join(base, name)
         if os.path.exists(p):

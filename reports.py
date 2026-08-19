@@ -5,6 +5,7 @@ reports.py
 """
 
 import os
+import sys
 from datetime import date
 
 from reportlab.lib import colors
@@ -34,7 +35,22 @@ MUTED = colors.HexColor("#8b97a8")
 # الحروف أو بالاتجاه الخاطئ) بدون أن يتوقف البرنامج عن العمل.
 # ---------------------------------------------------------------------------
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def _resource_dir():
+    """
+    مجلد الملفات المرافقة (الخطوط، الأيقونة).
+
+    عند التشغيل من الكود المصدري: مجلد هذا الملف.
+    عند التشغيل من ملف exe مُجمَّع: PyInstaller يفكّ الملفات إلى مجلد مؤقت
+    ويضع مساره في sys._MEIPASS — و__file__ حينها يشير إلى مسار وهمي داخل
+    الأرشيف، فلا تصلح للبحث عن الخطوط.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return meipass
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_BASE_DIR = _resource_dir()
 FONTS_DIR = os.path.join(_BASE_DIR, "fonts")
 
 

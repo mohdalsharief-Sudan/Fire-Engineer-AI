@@ -30,16 +30,29 @@ desktop.ini
 .idea/
 *.swp
 
-# ملفات البناء
+# مخرجات التغليف (تُعاد توليدها بـ build_exe.py)
 build/
 dist/
+*.exe
 *.spec
+!FireEngineerAI.spec
 
-# ����� ����� �����
-�����.py
-���_������.py
+# نسخ احتياطية يولّدها المُركِّبون
+*.bak
 
-# ����� ���� Google Fonts
+# كاش الاختبارات
+.pytest_cache/
+.coverage
+htmlcov/
+
+# أدوات تشخيص مؤقتة
+تشخيص.py
+فحص_المسار.py
+
+# بقايا حزمة Google Fonts
 static/
 NotoNaskhArabic-*.ttf
 README.txt
+
+# مجلدات نسخ احتياطية قديمة
+backup_before_*/
