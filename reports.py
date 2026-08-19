@@ -361,6 +361,13 @@ def _report_foot(story, styles, cfg):
     footer = (cfg.get("report_footer") or "").strip() \
         or "تم إنشاء هذا التقرير آليًا بواسطة FireEngineerAI"
     story.append(Paragraph(ar(footer), styles["BodyMuted"]))
+    # رقم الإصدار في التذييل: يسهّل معرفة أي نسخة أنتجت تقريرًا قديمًا
+    try:
+        from applog import __version__ as _v
+        story.append(Paragraph(ar(f"FireEngineerAI الإصدار {_v}"),
+                               styles["BodyMuted"]))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -836,11 +843,9 @@ def generate_project_report_pdf(project, path, company_name=None, settings=None)
             styles["BodyMuted"]
         ))
 
-    story.append(Spacer(1, 20))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=MUTED))
-    _footer = (cfg.get("report_footer") or "").strip() \
-        or "تم إنشاء هذا التقرير آليًا بواسطة FireEngineerAI"
-    story.append(Paragraph(ar(_footer), styles["BodyMuted"]))
+    # كان هنا تكرار لمنطق التذييل، فلم يرث تحسيناته (منها رقم الإصدار).
+    story.append(Spacer(1, 4))
+    _report_foot(story, styles, cfg)
 
     doc.build(story)
     return path

@@ -33,14 +33,20 @@ from database import (
     Contract, ContractVisit,
     search_projects, upcoming_inspections, unpaid_invoices, dashboard_stats,
     search_contracts, expiring_contracts, due_contract_visits,
-    ATTACHMENTS_DIR, REPORTS_DIR, BACKUPS_DIR, DB_PATH,
+    ATTACHMENTS_DIR, REPORTS_DIR, BACKUPS_DIR, DB_PATH, BASE_DIR,
 )
 from theme import (QSS, STATUS_COLORS, status_badge_style, alert_badge_style,
                    contract_badge_style, visit_badge_style)
 from settings import load_settings, save_settings, save_logo, clear_logo
 import reports as reports_module
+import applog
+from applog import (
+    __version__ as APP_VERSION, setup_logging, get_logger,
+    install_excepthook, create_backup, auto_backup_on_start, log_path,
+)
 
-APP_TITLE = "FireEngineerAI — نظام إدارة مشاريع الحماية من الحريق"
+APP_TITLE = (f"FireEngineerAI {APP_VERSION} — "
+             "نظام إدارة مشاريع الحماية من الحريق")
 
 # مصدر واحد لحالات المشروع (كانت مكرّرة في أكثر من موضع)
 PROJECT_STATUSES = ["Design", "Supply", "Install", "Testing", "Handover"]
@@ -429,13 +435,31 @@ class MainWindow(QMainWindow):
         self.reload_project_combos()
 
     def backup_database(self):
+        """
+        نسخة احتياطية يدوية.
+
+        كان الاسم يحمل التاريخ فقط، فأي نسخة ثانية في اليوم نفسه تمحو
+        الأولى — وهذا يعني أن نسخة بعد تلف البيانات تدمّر النسخة السليمة.
+        الآن: التاريخ + الوقت، ونسخ عبر واجهة SQLite الآمنة، مع التحقق من
+        سلامة الناتج والاحتفاظ بآخر 30 نسخة.
+        """
+        # نحفظ أي تغييرات معلّقة أولًا حتى تشمل النسخة آخر ما أُدخل
         try:
-            ts = date.today().isoformat()
-            dest = os.path.join(BACKUPS_DIR, f"db_backup_{ts}.sqlite3")
-            shutil.copy2(DB_PATH, dest)
-            QMessageBox.information(self, "نسخ احتياطي", f"تم إنشاء نسخة احتياطية:\n{dest}")
-        except Exception as e:
-            QMessageBox.warning(self, "خطأ", f"تعذر إنشاء نسخة احتياطية:\n{e}")
+            if self.session.dirty or self.session.new:
+                self.session.commit()
+        except Exception:
+            self.session.rollback()
+
+        ok, result = create_backup(DB_PATH, BACKUPS_DIR, keep=30)
+        if ok:
+            QMessageBox.information(
+                self, "نسخ احتياطي",
+                f"تم إنشاء نسخة احتياطية بنجاح:\n{result}"
+            )
+        else:
+            QMessageBox.warning(
+                self, "خطأ", f"تعذر إنشاء نسخة احتياطية:\n{result}"
+            )
 
     def company_currency(self):
         """عملة المنشأة من الإعدادات (افتراضيًا: ريال)."""
@@ -461,6 +485,9 @@ class MainWindow(QMainWindow):
             return True
         except Exception as e:
             self.session.rollback()
+            # التسجيل قبل العرض: كثير من الأخطاء يُغلق المستخدم رسالتها
+            # ثم يتعذّر تشخيصها لاحقًا لعدم بقاء أي أثر.
+            get_logger("db").exception("فشل %s", action)
             QMessageBox.critical(
                 self, "خطأ في قاعدة البيانات",
                 f"تعذر {action}. لم يتم حفظ أي تغيير.\n\nالتفاصيل:\n{e}"
@@ -2133,11 +2160,15 @@ class MainWindow(QMainWindow):
         folder_card, folder_layout = make_card("المجلدات")
         open_reports_btn = QPushButton("فتح مجلد التقارير")
         open_reports_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(REPORTS_DIR)))
+        open_log_btn = QPushButton("فتح ملف السجل")
+        open_log_btn.setToolTip("سجل الأحداث والأخطاء — أرفقه عند طلب المساعدة")
+        open_log_btn.clicked.connect(self.open_log_file)
         open_backups_btn = QPushButton("فتح مجلد النسخ الاحتياطية")
         open_backups_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(BACKUPS_DIR)))
         f_row = QHBoxLayout()
         f_row.addWidget(open_reports_btn)
         f_row.addWidget(open_backups_btn)
+        f_row.addWidget(open_log_btn)
         folder_layout.addLayout(f_row)
         layout.addWidget(folder_card)
 
@@ -2231,6 +2262,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "خطأ", f"تعذر إنشاء التقرير:\n{e}")
             return
         self._finish_report(report_path)
+
+    def open_log_file(self):
+        """يفتح ملف السجل، أو مجلد السجلات إن لم يُنشأ الملف بعد."""
+        p = log_path(BASE_DIR)
+        if os.path.exists(p):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(p))
+        else:
+            QMessageBox.information(
+                self, "معلومة",
+                "لم يُنشأ ملف السجل بعد.\nسيظهر بعد أول تشغيل كامل للبرنامج."
+            )
 
     def generate_contracts_report(self):
         scope = self.contracts_report_scope.currentData()
@@ -2592,7 +2634,11 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(out))
 
     def closeEvent(self, event):
-        self.session.close()
+        get_logger("app").info("إغلاق البرنامج")
+        try:
+            self.session.close()
+        except Exception:
+            get_logger("app").exception("تعذر إغلاق جلسة قاعدة البيانات")
         event.accept()
 
 
@@ -2607,7 +2653,20 @@ def _app_icon():
 
 
 def main():
-    init_db()
+    # الترتيب مقصود: التسجيل أولًا حتى تُلتقط أخطاء تهيئة قاعدة البيانات
+    # نفسها، ثم النسخة التلقائية قبل أي كتابة، ثم بناء الواجهة.
+    setup_logging(BASE_DIR)
+    log = get_logger("startup")
+
+    try:
+        init_db()
+    except Exception:
+        log.exception("فشل تهيئة قاعدة البيانات")
+        raise
+
+    # نسخة احتياطية تلقائية صامتة (مرة يوميًا كحد أقصى)
+    auto_backup_on_start(DB_PATH, BACKUPS_DIR, keep=30)
+
     app = QApplication(sys.argv)
 
     # على ويندوز: معرّف تطبيق مستقل حتى لا تُجمَّع النافذة تحت أيقونة
@@ -2624,7 +2683,12 @@ def main():
     app.setWindowIcon(_app_icon())
     app.setStyleSheet(QSS)
     win = MainWindow()
+
+    # بعد إنشاء النافذة حتى تظهر رسالة الخطأ فوقها لا خلفها
+    install_excepthook(BASE_DIR, win)
+
     win.show()
+    log.info("الواجهة جاهزة")
     sys.exit(app.exec())
 
 
