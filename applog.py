@@ -20,7 +20,7 @@ from logging.handlers import RotatingFileHandler
 
 # رقم إصدار البرنامج — يظهر في شريط العنوان وتذييل التقارير.
 # ارفعه مع كل تحديث ملموس حتى يمكن معرفة أي نسخة تعمل عند المستخدم.
-__version__ = "1.5.0"
+__version__ = "1.5.2"
 APP_VERSION = __version__
 
 _LOGGER_NAME = "fireengineer"
