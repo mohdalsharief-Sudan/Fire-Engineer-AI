@@ -13,6 +13,7 @@ app.py
 import os
 import shutil
 import sys
+import json
 from datetime import date, timedelta
 
 from PySide6.QtWidgets import (
@@ -507,7 +508,11 @@ class MainWindow(QMainWindow):
         new_btn = QPushButton("+ مشروع جديد")
         new_btn.setObjectName("PrimaryButton")
         new_btn.clicked.connect(self.new_project_form)
+        import_quote_btn = QPushButton("📥 استيراد عرض معتمد")
+        import_quote_btn.setObjectName("SecondaryButton")
+        import_quote_btn.clicked.connect(self.import_approved_quote)
         top_row.addWidget(new_btn)
+        top_row.addWidget(import_quote_btn)
         layout.addLayout(top_row)
 
         filters = QHBoxLayout()
@@ -987,8 +992,12 @@ class MainWindow(QMainWindow):
         new_client_btn = QPushButton("+ عميل جديد")
         new_client_btn.setObjectName("PrimaryButton")
         new_client_btn.clicked.connect(self.new_client_form)
+        import_clients_btn = QPushButton("📥 استيراد من التسعير")
+        import_clients_btn.setObjectName("SecondaryButton")
+        import_clients_btn.clicked.connect(self.import_clients_from_json)
         search_row.addWidget(self.client_search)
         search_row.addWidget(new_client_btn)
+        search_row.addWidget(import_clients_btn)
         list_layout.addLayout(search_row)
 
         self.clients_table = QTableWidget(0, 4)
@@ -1096,6 +1105,187 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "تم الحفظ", f"تم حفظ العميل #{c.id} بنجاح.")
         self.refresh_all()
         self.new_client_form()
+
+    def import_clients_from_json(self):
+        """استيراد العملاء من ملف JSON مصدَّر من fire-pricing (نظام التسعير)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "اختر ملف العملاء (من نظام التسعير)", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر قراءة الملف:\n{e}")
+            return
+
+        # دعم صيغتين: التصدير الموحد {clients: [...]} أو قائمة مباشرة
+        clients = data.get("clients", []) if isinstance(data, dict) else data
+        if not isinstance(clients, list) or not clients:
+            QMessageBox.information(self, "لا يوجد عملاء", "الملف لا يحتوي على عملاء.")
+            return
+
+        existing = {
+            c.name.strip().lower()
+            for c in self.session.query(Client).all()
+        }
+        imported, skipped = 0, 0
+        for c in clients:
+            name = str(c.get("name", "")).strip()
+            if not name:
+                skipped += 1
+                continue
+            if name.lower() in existing:
+                skipped += 1
+                continue
+            client = Client(name=name)
+            client.phone = str(c.get("phone", "") or "")
+            client.email = str(c.get("email", "") or "")
+            client.contact_person = str(c.get("contact_person", "") or "")
+            # السجل التجاري والمدينة يُدمجان في الحقول المتاحة
+            addr_parts = []
+            city = str(c.get("city", "") or "")
+            address = str(c.get("address", "") or "")
+            if city:
+                addr_parts.append(city)
+            if address:
+                addr_parts.append(address)
+            client.address = " | ".join(p for p in addr_parts if p)
+            notes_parts = []
+            cr = str(c.get("cr_number", "") or "")
+            if cr:
+                notes_parts.append("س.ت: " + cr)
+            notes = str(c.get("notes", "") or "")
+            if notes:
+                notes_parts.append(notes)
+            client.notes = "\n".join(notes_parts)
+            self.session.add(client)
+            existing.add(name.lower())
+            imported += 1
+
+        if not self.safe_commit("استيراد العملاء"):
+            return
+        QMessageBox.information(
+            self, "تم الاستيراد",
+            f"تم استيراد {imported} عميل جديد.\n"
+            f"تم تخطي {skipped} (مكرر أو بدون اسم)."
+        )
+        self.refresh_all()
+        self.new_client_form()
+
+    def import_approved_quote(self):
+        """استيراد عرض سعر معتمد من fire-pricing → ينشئ عميلاً (إن لزم) + مشروعاً + عقداً بالقيمة الفعلية."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "اختر ملف العرض المعتمد (من نظام التسعير)", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "خطأ", f"تعذر قراءة الملف:\n{e}")
+            return
+
+        if not isinstance(data, dict) or data.get("format") != "fire-safety-quote-v1":
+            QMessageBox.warning(self, "ملف غير صالح", "هذا الملف ليس عرض سعر معتمدًا من نظام التسعير.")
+            return
+
+        client_data = data.get("client") or {}
+        project_data = data.get("project") or {}
+        contract_data = data.get("contract") or {}
+        items = data.get("items") or []
+        quote_data = data.get("quote") or {}
+
+        # 1) العميل — إنشاء إن لم يوجد (مطابقة بالاسم)
+        client = None
+        client_name = str(client_data.get("name", "")).strip()
+        if client_name:
+            client = (
+                self.session.query(Client)
+                .filter(Client.name.ilike(f"%{client_name}%"))
+                .first()
+            )
+            if client is None:
+                client = Client(name=client_name)
+                client.phone = str(client_data.get("phone", "") or "")
+                client.email = str(client_data.get("email", "") or "")
+                client.contact_person = str(client_data.get("contact_person", "") or "")
+                addr = []
+                if client_data.get("city"):
+                    addr.append(str(client_data["city"]))
+                if client_data.get("address"):
+                    addr.append(str(client_data["address"]))
+                client.address = " | ".join(a for a in addr if a)
+                notes = []
+                if client_data.get("cr_number"):
+                    notes.append("س.ت: " + str(client_data["cr_number"]))
+                if client_data.get("notes"):
+                    notes.append(str(client_data["notes"]))
+                client.notes = "\n".join(notes)
+                self.session.add(client)
+                self.session.flush()
+
+        # 2) المشروع
+        project_name = str(project_data.get("name", "")).strip() or "مشروع من عرض معتمد"
+        project = Project(name=project_name)
+        project.client_id = client.id if client else None
+        project.site = str(project_data.get("location", "") or "")
+        project.scope = self._format_quote_items_for_scope(items)
+        project.status = "Design"
+        project.notes = (
+            "مستورد من عرض سعر معتمد" +
+            (f" (رقم العرض: {quote_data.get('quoteNo', '')})" if quote_data.get("quoteNo") else "")
+        )
+        self.session.add(project)
+        self.session.flush()
+
+        # 3) العقد — بالقيمة التعاقدية الفعلية (بعد الخصم)
+        contract = Contract(client_id=client.id if client else None, project_id=project.id)
+        contract.contract_number = str(quote_data.get("quoteNo", "") or "")
+        contract.title = str(contract_data.get("title", "") or f"عقد {project_name}")
+        contract.value = float(contract_data.get("value", 0) or 0)
+        contract.notes = self._format_contract_notes(contract_data)
+        self.session.add(contract)
+
+        if not self.safe_commit("استيراد عرض معتمد"):
+            return
+
+        QMessageBox.information(
+            self, "تم الاستيراد",
+            f"تم إنشاء:\n"
+            f"• العميل: {client.name if client else '—'}\n"
+            f"• المشروع: {project.name}\n"
+            f"• العقد بقيمة: {contract.value:,.2f}"
+        )
+        self.refresh_all()
+        self.navigate_to("projects")
+
+    def _format_quote_items_for_scope(self, items):
+        """يبني نص نطاق العمل من بنود العرض (اسم × كمية)."""
+        if not items:
+            return ""
+        lines = []
+        for it in items:
+            name = str(it.get("name", "")).strip()
+            qty = it.get("qty")
+            if name:
+                lines.append(f"- {name}" + (f" × {qty}" if qty else ""))
+        return "\n".join(lines[:200])
+
+    def _format_contract_notes(self, contract_data):
+        """يبني ملاحظات العقد: رقم العرض، الخصم، الضريبة، الإجمالي."""
+        notes = []
+        if contract_data.get("quoteNo"):
+            notes.append("رقم العرض: " + str(contract_data["quoteNo"]))
+        if contract_data.get("discount_pct"):
+            notes.append(f"خصم: {contract_data['discount_pct']}%")
+        if contract_data.get("vat"):
+            notes.append(f"ضريبة: {contract_data['vat']:,.2f}")
+        if contract_data.get("grand_total"):
+            notes.append(f"الإجمالي النهائي: {contract_data['grand_total']:,.2f}")
+        return "\n".join(notes)
 
     def delete_current_client(self):
         if self.current_edit_client_id is None:
