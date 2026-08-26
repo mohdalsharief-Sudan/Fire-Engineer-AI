@@ -1260,7 +1260,7 @@ class MainWindow(QMainWindow):
             f"• العقد بقيمة: {contract.value:,.2f}"
         )
         self.refresh_all()
-        self.navigate_to("projects")
+        self.show_projects()
 
     def _format_quote_items_for_scope(self, items):
         """يبني نص نطاق العمل من بنود العرض (اسم × كمية)."""
