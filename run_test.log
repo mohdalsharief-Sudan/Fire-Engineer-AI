@@ -1,0 +1,7 @@
+✅ اتصال مكتبة المعدات المركزية (PostgreSQL) ناجح
+2026-10-01 04:34:57 | INFO     | fireengineer | ============================================================
+2026-10-01 04:34:57 | INFO     | fireengineer | بدء تشغيل FireEngineerAI الإصدار 1.5.2
+2026-10-01 04:34:57 | INFO     | fireengineer | بايثون 3.14.7 | المنصة win32
+2026-10-01 04:34:57 | INFO     | fireengineer.backup | توجد نسخة تلقائية لليوم — تم التخطي
+2026-10-01 04:34:59 | INFO     | fireengineer.startup | الواجهة جاهزة
+2026-10-01 04:34:59 | ERROR    | fireengineer | library loader error: type object 'LibraryEquipment' has no attribute 'cat_name'

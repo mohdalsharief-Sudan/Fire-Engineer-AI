@@ -23,7 +23,16 @@ BACKUPS_DIR = os.path.join(BASE_DIR, "backups")
 for d in (BASE_DIR, ATTACHMENTS_DIR, REPORTS_DIR, BACKUPS_DIR):
     os.makedirs(d, exist_ok=True)
 
-DB_URL = f"sqlite:///{DB_PATH}"
+# PostgreSQL (مصدر الحقيقة المركزي — fire_equipment)
+# PostgreSQL الذي يشاركه برنامج التسعير وغيره
+PG_USER = os.environ.get("PG_USER", "postgres")
+PG_PASSWORD = os.environ.get("PG_PASSWORD", "Msh20041970")
+PG_HOST = os.environ.get("PG_HOST", "localhost")
+PG_PORT = os.environ.get("PG_PORT", "5432")
+PG_DB = os.environ.get("PG_DB", "fire_equipment")
+DB_URL = f"postgresql+psycopg2://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
+
+# اتصال SQLAlchemy PostgreSQL
 Base = declarative_base()
 engine = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine)
@@ -31,11 +40,14 @@ SessionLocal = sessionmaker(bind=engine)
 
 # SQLite يتجاهل قيود المفاتيح الأجنبية (ومنها ON DELETE SET NULL) ما لم تُفعَّل
 # صراحةً لكل اتصال. بدون هذا السطر يبقى client_id مشيرًا لعميل محذوف.
+# ملاحظة: هذه الدالة تعمل فقط مع SQLite — PostgreSQL يدعم FKs بشكل طبيعي
 @event.listens_for(engine, "connect")
 def _enable_sqlite_fk(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+    # فقط مع SQLite — تجاهل مع PostgreSQL
+    if DB_URL.startswith("sqlite"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +55,7 @@ def _enable_sqlite_fk(dbapi_connection, connection_record):
 # ---------------------------------------------------------------------------
 
 class Client(Base):
-    __tablename__ = "clients"
+    __tablename__ = "fea_clients"
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
@@ -66,11 +78,11 @@ class Client(Base):
 
 
 class Project(Base):
-    __tablename__ = "projects"
+    __tablename__ = "fea_projects"
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    client_id = Column(Integer, ForeignKey("clients.id", ondelete="SET NULL"))
+    client_id = Column(Integer, ForeignKey("fea_clients.id", ondelete="SET NULL"))
     site = Column(String)
     building = Column(String)
     scope = Column(String)
@@ -99,12 +111,12 @@ class Project(Base):
 
 
 class Invoice(Base):
-    __tablename__ = "invoices"
+    __tablename__ = "fea_invoices"
 
     id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("fea_projects.id"), nullable=False)
     # فاتورة عقد صيانة (اختياري) — تبقى الفاتورة مرتبطة بالمشروع كما هي
-    contract_id = Column(Integer, ForeignKey("contracts.id", ondelete="SET NULL"))
+    contract_id = Column(Integer, ForeignKey("fea_contracts.id", ondelete="SET NULL"))
     invoice_number = Column(String)
     amount = Column(Float, default=0.0)
     issue_date = Column(Date)
@@ -125,10 +137,10 @@ class Invoice(Base):
 
 
 class Equipment(Base):
-    __tablename__ = "equipment"
+    __tablename__ = "fea_equipment"
 
     id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("fea_projects.id"), nullable=False)
     name = Column(String, nullable=False)
     equipment_type = Column(String)   # e.g. Fire Extinguisher, Pump, Panel, Sprinkler Head...
     location = Column(String)
@@ -175,13 +187,13 @@ class Equipment(Base):
 class Contract(Base):
     """عقد صيانة سنوي لعميل (مع إمكانية ربطه بمشروع/موقع محدد)."""
 
-    __tablename__ = "contracts"
+    __tablename__ = "fea_contracts"
 
     id = Column(Integer, primary_key=True)
     contract_number = Column(String)
-    client_id = Column(Integer, ForeignKey("clients.id", ondelete="SET NULL"))
+    client_id = Column(Integer, ForeignKey("fea_clients.id", ondelete="SET NULL"))
     # اختياري: عقد خاص بموقع/مشروع بعينه بدل كل مواقع العميل
-    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"))
+    project_id = Column(Integer, ForeignKey("fea_projects.id", ondelete="SET NULL"))
     title = Column(String)
     scope = Column(String)              # نطاق الصيانة: إنذار، رشاشات، شامل...
     start_date = Column(Date)
@@ -276,10 +288,10 @@ class Contract(Base):
 class ContractVisit(Base):
     """زيارة صيانة ضمن عقد."""
 
-    __tablename__ = "contract_visits"
+    __tablename__ = "fea_contract_visits"
 
     id = Column(Integer, primary_key=True)
-    contract_id = Column(Integer, ForeignKey("contracts.id", ondelete="CASCADE"),
+    contract_id = Column(Integer, ForeignKey("fea_contracts.id", ondelete="CASCADE"),
                          nullable=False)
     visit_date = Column(Date)
     status = Column(String, default="Scheduled")  # Scheduled, Done, Missed

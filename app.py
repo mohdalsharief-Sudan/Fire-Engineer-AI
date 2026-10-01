@@ -23,11 +23,12 @@ from PySide6.QtWidgets import (
     QLabel, QStackedWidget, QMessageBox, QAbstractItemView, QListWidget,
     QCheckBox,
     QListWidgetItem, QDoubleSpinBox, QSpinBox, QScrollArea, QFrame,
-    QSizePolicy, QButtonGroup, QHeaderView, QPlainTextEdit
+    QSizePolicy, QButtonGroup, QHeaderView, QPlainTextEdit, QGroupBox
 )
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
-from PySide6.QtCore import Qt, QDate, QUrl
+from PySide6.QtCore import Qt, QDate, QUrl, QThread, Signal, QTimer
 from sqlalchemy import or_
+from sqlalchemy.orm import joinedload
 
 from database import (
     init_db, get_session, Project, Client, Invoice, Equipment,
@@ -39,6 +40,9 @@ from database import (
 from theme import (QSS, STATUS_COLORS, status_badge_style, alert_badge_style,
                    contract_badge_style, visit_badge_style)
 from settings import load_settings, save_settings, save_logo, clear_logo
+from library_db import get_library_session, LibraryEquipment, LibraryCategory, LibraryManufacturer
+from cad_tool_tab import CadToolTab
+from pricing_tab import PricingTab
 import reports as reports_module
 import applog
 from applog import (
@@ -63,6 +67,9 @@ NAV_ITEMS = [
     ("projects", "المشاريع"),
     ("clients", "العملاء"),
     ("equipment", "المعدات والفحص"),
+    ("library", "المكتبة المركزية"),
+    ("pricing", "التسعير والعروض"),
+    ("cad", "تحليل CAD"),
     ("invoices", "الفواتير"),
     ("contracts", "عقود الصيانة"),
     ("reports", "التقارير"),
@@ -167,6 +174,63 @@ def make_stat_card(value_text, label_text):
     return card
 
 
+# ────────────────────────────────────────────────────────────────
+# LibraryLoaderThread — يحمّل بيانات المكتبة في خلفية (QThread)
+# حتى لا يتجمّد الواجهة أثناء استعلام PostgreSQL
+# ────────────────────────────────────────────────────────────────
+class LibraryLoaderThread(QThread):
+    """ينفذ استعلامات المكتبة في خيط خلفي ويعيد النتائج عبر Signals."""
+
+    data_ready = Signal(object, object, object, object)  # قائمة المعدات + الفئات
+    error_occurred = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search_text = None
+        self._category_filter = None
+
+    def set_filters(self, search_text=None, category_filter=None):
+        self._search_text = search_text
+        self._category_filter = category_filter
+
+    def run(self):
+            try:
+                session = get_library_session()
+                query = session.query(LibraryEquipment).filter(
+                    LibraryEquipment.is_active == 1
+                )
+                if self._category_filter:
+                    query = query.filter(
+                        LibraryEquipment.category.has(name=self._category_filter)
+                    )
+                if self._search_text:
+                    like = f"%{self._search_text}%"
+                    # البحث في الحقول الموجودة مباشرة
+                    query = query.filter(
+                        or_(
+                            LibraryEquipment.code.ilike(like),
+                            LibraryEquipment.name.ilike(like),
+                            LibraryEquipment.type_ar.ilike(like),
+                            LibraryEquipment.supplier_name.ilike(like),
+                        )
+                    )
+                rows = query.order_by(
+                    LibraryEquipment.code
+                ).all()
+                cats = (
+                    session.query(LibraryCategory)
+                    .order_by(LibraryCategory.sort_order, LibraryCategory.name)
+                    .all()
+                )
+                session.close()
+                self.data_ready.emit(rows, cats, len(rows), 0)
+            except Exception as exc:
+                self.error_occurred.emit(str(exc))
+
+
+# ────────────────────────────────────────────────────────────────
+# MainWindow
+# ────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -206,16 +270,20 @@ class MainWindow(QMainWindow):
         self.page_project_details = self.build_project_details_page()
         self.page_clients = self.build_clients_page()
         self.page_equipment = self.build_equipment_page()
+        self.page_library = self.build_library_page()
         self.page_invoices = self.build_invoices_page()
         self.page_contracts = self.build_contracts_page()
         self.page_reports = self.build_reports_page()
+        self.page_reports = self.build_reports_page()
         self.page_settings = self.build_settings_page()
+        self.page_pricing = self.build_pricing_page()
+        self.page_cad = self.build_cad_page()
 
         for p in [
             self.page_dashboard, self.page_projects, self.page_project_form,
             self.page_project_details, self.page_clients, self.page_equipment,
-            self.page_invoices, self.page_contracts, self.page_reports,
-            self.page_settings
+            self.page_library, self.page_invoices, self.page_contracts,
+            self.page_reports, self.page_settings, self.page_pricing, self.page_cad
         ]:
             self.pages.addWidget(p)
 
@@ -252,6 +320,9 @@ class MainWindow(QMainWindow):
             "projects": self.show_projects,
             "clients": self.show_clients,
             "equipment": self.show_equipment,
+            "library": self.show_library,
+            "pricing": self.show_pricing,
+            "cad": self.show_cad,
             "invoices": self.show_invoices,
             "contracts": self.show_contracts,
             "reports": self.show_reports,
@@ -417,7 +488,7 @@ class MainWindow(QMainWindow):
                                alert_badge_style(_lvl))
 
     # ------------------------------------------------------------------
-    # Navigation show_* helpers (نتابع في الأجزاء التالية)
+    # Navigation show_* helpers
     # ------------------------------------------------------------------
     def show_dashboard(self):
         self.set_active_nav("dashboard")
@@ -425,11 +496,20 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.page_dashboard)
         self.statusBar().showMessage("لوحة المعلومات")
 
+    def show_library(self):
+        self.set_active_nav("library")
+        self.pages.setCurrentWidget(self.page_library)
+        self.statusBar().showMessage("جاري تحميل المكتبة...")
+        # تحميل 非утowski — ي disassembly عبر QTimer بعد بناء event loop
+        from PySide6.QtCore import QTimer, QThread
+        QTimer.singleShot(50, self.refresh_library)
+
     def refresh_all(self):
         self.refresh_dashboard()
         self.refresh_projects_table()
         self.refresh_clients_table()
         self.refresh_equipment_table()
+        self.refresh_library()
         self.refresh_invoices_table()
         self.refresh_contracts_table()
         self.reload_client_combo()
@@ -2568,8 +2648,266 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
 
     # ------------------------------------------------------------------
-    # Navigation
+    # المكتبة المركزية - عرض معدات الحريق من PostgreSQL
     # ------------------------------------------------------------------
+    def build_library_page(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(800)
+        scroll.setMinimumHeight(600)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+
+        self.page_header(layout, "المكتبة المركزية للمعدات",
+                       "348 جهاز حماية من الحرائق — جميع الأنظمة: رشاشات، مضخات، كبومات، إنذارات، صمامات...")
+
+        # شريط بحث سريع
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("بحث:"))
+        self.lib_search = QLineEdit()
+        self.lib_search.setPlaceholderText("اسم الجهاز، الرقم، الشركة المصنّعة...")
+        self.lib_search.setFixedWidth(280)
+        search_row.addWidget(self.lib_search)
+        self.lib_search.editingFinished.connect(self.search_library)
+        self.lib_search.textChanged.connect(self.search_library)
+        search_row.addStretch()
+        self.lib_filter_cat = QComboBox()
+        self.lib_filter_cat.addItem("كل الفئات")
+        self.lib_filter_cat.setFixedWidth(180)
+        search_row.addWidget(self.lib_filter_cat)
+        self.lib_filter_cat.currentTextChanged.connect(self.search_library)
+        layout.addLayout(search_row)
+
+        # لوحة الإحصائيات العلوية
+        stats_row = QHBoxLayout()
+        self.lib_stat_count = make_stat_card("0", "إجمالي المعدات")
+        self.lib_stat_active = make_stat_card("0", "نشطة")
+        self.lib_stat_cats = make_stat_card("0", "فئات")
+        for c in [self.lib_stat_count, self.lib_stat_active, self.lib_stat_cats]:
+            stats_row.addWidget(c)
+        layout.addLayout(stats_row)
+
+        # الجدول — استخدام QGroupBox كحاوية واضحة (ليس make_card الذي يترك QFrame بدون والد)
+        self.lib_group = QGroupBox("بند: المكتبة الكاملة لكل معدات الحريق")
+        self.lib_group.setObjectName("Card")
+        group_layout = QVBoxLayout(self.lib_group)
+        group_layout.setContentsMargins(16, 14, 16, 14)
+        self.lib_table = QTableWidget(0, 7)
+        self.lib_table.setHorizontalHeaderLabels(
+            ["الرمز", "الاسم", "الفئة", "الشركة", "السعر الشراء (ر.س)", "سعر التثبيت (ر.س)", "الدقة/النوع"]
+        )
+        self.lib_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.lib_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.lib_table.setAlternatingRowColors(True)
+        tune_table(self.lib_table, stretch_col=1)
+        # ربط النقر المزدوج لإضافة العنصر
+        self.lib_table.cellDoubleClicked.connect(self._add_library_item)
+        group_layout.addWidget(self.lib_table)
+        layout.addWidget(self.lib_group)
+
+        # أزرار الإضافة السريعة
+        btn_row = QHBoxLayout()
+        self.lib_add_to_project = QPushButton("➕ إضافة للمشروع الحالي")
+        self.lib_add_to_project.setObjectName("PrimaryButton")
+        self.lib_add_to_project.setFixedWidth(180)
+        self.lib_add_to_project.clicked.connect(self._add_library_item)
+        self.lib_add_to_project.clicked.connect(
+            lambda: self.statusBar().showMessage("✅ تم الضغط على زر الإضافة!")
+        )
+        btn_row.addWidget(self.lib_add_to_project)
+        btn_row.addStretch()
+        self.lib_add_qty_label = QLabel("")
+        self.lib_add_qty_label.setObjectName("PageSubtitle")
+        btn_row.addWidget(self.lib_add_qty_label)
+        layout.addLayout(btn_row)
+
+        layout.addStretch()
+        scroll.setWidget(inner)
+        return scroll
+
+    def refresh_library(self):
+        """إظهار صفحة المكتبة وتحميل البيانات في الخلفية."""
+        self.statusBar().showMessage("جاري تحميل المكتبة...")
+        self.lib_stat_count.value_label.setText("جاري التحميل...")
+        self.lib_stat_active.value_label.setText("جاري التحميل...")
+        self.lib_stat_cats.value_label.setText("جاري التحميل...")
+        self.lib_table.setRowCount(0)
+        QTimer.singleShot(100, self._start_library_load)
+
+    def _start_library_load(self):
+        """بدء تحميل المكتبة في خلفية عبر QThread."""
+        try:
+            self.lib_loader_thread = LibraryLoaderThread(self)
+            self.lib_loader_thread.data_ready.connect(self._on_library_loaded)
+            self.lib_loader_thread.error_occurred.connect(self._on_library_error)
+            self.lib_loader_thread.start()
+        except Exception as e:
+            self.statusBar().showMessage(f"خطأ في تشغيل مكتبة التحميل: {e}")
+            get_logger().error(f"library loader start error: {e}")
+
+    def _on_library_loaded(self, rows, cats, count, _unused):
+        """يُستدعى عند اكتمال تحميل المكتبة من الخيط الخلفي."""
+        # فحص: هل الـ widget لا يزال موجودًا؟
+        if self.parent() is None and not self.isVisible():
+            return
+        try:
+            # تحميل الفئات في الـ combo
+            self.lib_filter_cat.clear()
+            self.lib_filter_cat.addItem("كل الفئات")
+            for c in cats:
+                self.lib_filter_cat.addItem(c.name)
+
+            # عرض الإحصائيات
+            total = len(rows)
+            active = sum(1 for r in rows if getattr(r, 'is_active', 1))
+            self.lib_stat_count.value_label.setText(str(total))
+            self.lib_stat_active.value_label.setText(str(active))
+            self.lib_stat_cats.value_label.setText(str(len(cats)))
+
+            # بناء الجدول
+            self.lib_table.setRowCount(0)
+            for r in rows:
+                row = self.lib_table.rowCount()
+                self.lib_table.insertRow(row)
+                code = getattr(r, 'code', '') or ''
+                name = getattr(r, 'name', '') or getattr(r, 'type_ar', '') or ''
+                cat_name = ''
+                cat = getattr(r, 'category', None)
+                if cat is not None:
+                    cat_name = getattr(cat, 'name', '') or ''
+                manuf = getattr(r, 'supplier_name', '') or ''
+                price = getattr(r, 'supply_price_sar', 0) or 0
+                install = getattr(r, 'install_price_sar', 0) or 0
+                type_ar = getattr(r, 'type_ar', '') or ''
+                self.lib_table.setItem(row, 0, QTableWidgetItem(str(code)))
+                self.lib_table.setItem(row, 1, QTableWidgetItem(str(name)))
+                self.lib_table.setItem(row, 2, QTableWidgetItem(str(cat_name)))
+                self.lib_table.setItem(row, 3, QTableWidgetItem(str(manuf)))
+                self.lib_table.setItem(row, 4, QTableWidgetItem(f"{price:,.0f}"))
+                self.lib_table.setItem(row, 5, QTableWidgetItem(f"{install:,.0f}"))
+                self.lib_table.setItem(row, 6, QTableWidgetItem(str(type_ar)))
+            tune_table(self.lib_table, stretch_col=1)
+            self.statusBar().showMessage(f"تم تحميل {total} بند من المكتبة")
+            get_logger().info(f"library loaded: {total} items")
+        except RuntimeError:
+            pass
+        except Exception as e:
+            try:
+                self.statusBar().showMessage(f"خطأ في عرض المكتبة: {e}")
+            except Exception:
+                pass
+            get_logger().error(f"library display error: {e}")
+
+
+    def _add_library_item(self, row=None, column=None):
+        """إضافة بند من المكتبة إلى المشروع — يُستدعى من النقر المزدوج أو زر الإضافة."""
+        try:
+            selected = None
+            if row is not None:
+                selected = row
+            elif self.lib_table.currentRow() >= 0:
+                selected = self.lib_table.currentRow()
+            else:
+                try:
+                    self.statusBar().showMessage("يرجى تحديد بند أولاً")
+                except Exception:
+                    pass
+                return
+            if selected is None:
+                try:
+                    self.statusBar().showMessage("يرجى تحديد بند أولاً")
+                except Exception:
+                    pass
+                return
+            item_code = self.lib_table.item(selected, 0)
+            item_name = self.lib_table.item(selected, 1)
+            if item_code and item_code.text():
+                code = item_code.text()
+                name = item_name.text() if item_name else ""
+                try:
+                    self.statusBar().showMessage(f"تم تحديد: {code} — {name}")
+                except Exception:
+                    pass
+                get_logger().info(f"library item selected: {code}")
+            else:
+                try:
+                    self.statusBar().showMessage("بند غير صالح")
+                except Exception:
+                    pass
+        except RuntimeError:
+            pass
+        except Exception as e:
+            try:
+                self.statusBar().showMessage(f"خطأ في الإضافة: {e}")
+            except Exception:
+                pass
+            get_logger().error(f"library add error: {e}")
+
+    def _on_library_error(self, msg):
+            """يُستدعى عند خطأ في التحميل الخلفي."""
+            try:
+                self.statusBar().showMessage(f"خطأ في المكتبة: {msg}")
+            except Exception:
+                pass
+            get_logger().error(f"library loader error: {msg}")
+
+    def load_library_table(self, search_text=None, category_filter=None):
+        try:
+            session = get_library_session()
+            query = session.query(LibraryEquipment).filter(
+                LibraryEquipment.is_active == 1)
+            if search_text and search_text.strip():
+                s = f"%{search_text.strip()}%"
+                query = query.filter(
+                    or_(
+                        LibraryEquipment.name.ilike(s),
+                        LibraryEquipment.type_ar.ilike(s),
+                        LibraryEquipment.code.ilike(s),
+                        LibraryEquipment.supplier_name.ilike(s)
+                    )
+                )
+            if category_filter and category_filter != "كل الفئات":
+                query = query.join(LibraryCategory).filter(
+                    LibraryCategory.name == category_filter)
+            items = query.order_by(LibraryEquipment.name).limit(500).all()
+            self.lib_table.setRowCount(len(items))
+            for i, eq in enumerate(items):
+                cat = eq.category
+                cat_name = cat.name if cat else "-"
+                row = i
+                self.lib_table.setItem(row, 0, QTableWidgetItem(str(eq.code or "")))
+                self.lib_table.setItem(row, 1, QTableWidgetItem(str(eq.name or eq.type_ar or "")))
+                self.lib_table.setItem(row, 2, QTableWidgetItem(str(cat_name)))
+                self.lib_table.setItem(row, 3, QTableWidgetItem(str(eq.supplier_name or "")))
+                sp = float(getattr(eq, 'supply_price_sar', 0) or 0)
+                ip = float(getattr(eq, 'install_price_sar', 0) or 0)
+                self.lib_table.setItem(row, 4, QTableWidgetItem(f"{sp:,.0f}"))
+                self.lib_table.setItem(row, 5, QTableWidgetItem(f"{ip:,.0f}"))
+                self.lib_table.setItem(row, 6, QTableWidgetItem(str(eq.type_ar or "-")))
+            self.lib_table.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.Stretch)
+            self.statusBar().showMessage(f"عرض {len(items)} بند من المكتبة")
+        except Exception as e:
+            get_logger().error(f"library table load error: {e}")
+            self.statusBar().showMessage(f"⚠️ خطأ في تحميل الجدول: {e}")
+
+    def search_library(self):
+        """Գրքի էջի վրա գրառված տեքստով որոնում առանց սխսելիս։"""
+        text = self.lib_search.text().strip()
+        cat = self.lib_filter_cat.currentText()
+        self.load_library_table(text if text else None, cat if cat != "كل الفئات" else None)
+
+    def show_reports(self):
+        self.set_active_nav("reports")
+        self.pages.setCurrentWidget(self.page_reports)
+        self.statusBar().showMessage("التقارير")
+
+    def show_settings(self):
+        self.set_active_nav("settings")
+        self.load_settings_into_form()
+        self.pages.setCurrentWidget(self.page_settings)
+        self.statusBar().showMessage("إعدادات المنشأة")
+
     def show_projects(self):
         self.set_active_nav("projects")
         self.refresh_projects_table()
@@ -2600,16 +2938,49 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.page_contracts)
         self.statusBar().showMessage("عقود الصيانة السنوية")
 
-    def show_reports(self):
-        self.set_active_nav("reports")
-        self.pages.setCurrentWidget(self.page_reports)
-        self.statusBar().showMessage("التقارير")
+    # ------------------------------------------------------------------
+    # التسعير والعروض (Pricing)
+    # ------------------------------------------------------------------
+    def build_pricing_page(self):
+        w = PricingTab()
+        w.setObjectName("pricing_page")
+        return w
 
-    def show_settings(self):
-        self.set_active_nav("settings")
-        self.load_settings_into_form()
-        self.pages.setCurrentWidget(self.page_settings)
-        self.statusBar().showMessage("إعدادات المنشأة")
+    def show_pricing(self):
+        self.set_active_nav("pricing")
+        self.refresh_pricing()
+        self.pages.setCurrentWidget(self.page_pricing)
+        self.statusBar().showMessage("التسعير والعروض — إنشاء عرض جديد أو اختيار مشروع")
+
+    def refresh_pricing(self):
+        try:
+            if hasattr(self.page_pricing, 'refresh'):
+                self.page_pricing.refresh()
+        except Exception as e:
+            self.statusBar().showMessage(f"خطأ في التسعير: {e}")
+            get_logger().error(f"pricing refresh error: {e}")
+
+    # ------------------------------------------------------------------
+    # تحليل CAD
+    # ------------------------------------------------------------------
+    def build_cad_page(self):
+        w = CadToolTab()
+        w.setObjectName("cad_page")
+        return w
+
+    def show_cad(self):
+        self.set_active_nav("cad")
+        self.refresh_cad()
+        self.pages.setCurrentWidget(self.page_cad)
+        self.statusBar().showMessage("تحليل CAD — افتح ملف DXF لتحليل أنظمة الحريق")
+
+    def refresh_cad(self):
+        try:
+            if hasattr(self.page_cad, 'refresh'):
+                self.page_cad.refresh()
+        except Exception as e:
+            self.statusBar().showMessage(f"خطأ في CAD: {e}")
+            get_logger().error(f"cad refresh error: {e}")
 
     # ------------------------------------------------------------------
     # Settings (بيانات المنشأة في ترويسة التقارير)
@@ -2859,6 +3230,24 @@ def main():
     auto_backup_on_start(DB_PATH, BACKUPS_DIR, keep=30)
 
     app = QApplication(sys.argv)
+
+    # ── تلقّب أخطاء داخل الـ slots على مستوى Qt (ما لا يمسكه sys.excepthook) ──
+    import logging as _logging
+    from PySide6.QtCore import qInstallMessageHandler
+
+    # Qt	msg handler: mode is 0=Debug,1=Info,2=Warning,3=Critical,4=Fatal
+    from PySide6.QtCore import qInstallMessageHandler
+
+    _msg_level = {0: _logging.DEBUG, 1: _logging.INFO,
+                  2: _logging.WARNING, 3: _logging.ERROR,
+                  4: _logging.CRITICAL}
+
+    def _qt_msg_handler(mode, context, message):
+        loc = f"{context.file}:{context.line}" if context and context.file else ""
+        lvl = _msg_level.get(mode, _logging.WARNING)
+        _logging.log(lvl, f"[Qt] {message} {loc}")
+
+    qInstallMessageHandler(_qt_msg_handler)
 
     # على ويندوز: معرّف تطبيق مستقل حتى لا تُجمَّع النافذة تحت أيقونة
     # بايثون العامة في شريط المهام، بل تظهر بأيقونة البرنامج الخاصة.
